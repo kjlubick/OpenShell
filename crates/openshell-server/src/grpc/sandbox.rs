@@ -2552,21 +2552,8 @@ pub(super) async fn handle_exec_sandbox(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
-    let stdin_payload = req.stdin;
-    let execution_timeout = req
-        .execution_timeout
-        .as_ref()
-        .map(openshell_core::time::duration_to_std)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let request_tty = req.tty;
-    let (cols, rows) = pty_dimensions(req.cols, req.rows);
-
+    let prepared = PreparedExecRequest::try_from(req)?;
     let sandbox_id = sandbox.object_id().to_string();
-
-    let no_login_shell = req.no_login_shell;
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
@@ -2577,22 +2564,9 @@ pub(super) async fn handle_exec_sandbox(
             return;
         };
 
-        if let Err(err) = stream_exec_over_relay(
-            tx.clone(),
-            &sandbox_id,
-            &channel_id,
-            relay_stream,
-            &command_str,
-            stdin_payload,
-            execution_timeout,
-            request_tty,
-            no_login_shell,
-            cols,
-            rows,
-            completion,
-        )
-        .await
-        {
+        let exec = RelayExec::new(relay_stream, &sandbox_id, &channel_id, prepared, tx.clone())
+            .with_completion(completion);
+        if let Err(err) = exec.run().await {
             warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandbox failed");
             let _ = tx.send(Err(err)).await;
         }
@@ -3060,8 +3034,17 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         .await
         .take()
         .ok_or_else(|| Status::internal("interactive input already claimed"))?;
-    let req = super::mutation_replay::streaming::start(request.get_ref())?;
-    validate_exec_start(req)?;
+    // Take the start payload by ownership after consuming its extensions, so
+    // preparing the command can move buffered stdin without cloning it.
+    let Some(openshell_core::proto::exec_sandbox_input::Payload::Start(req)) =
+        request.into_inner().payload
+    else {
+        return Err(openshell_core::rpc_error::invalid_argument(
+            "start",
+            "first message must be a start payload",
+        ));
+    };
+    validate_exec_start(&req)?;
 
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
@@ -3088,18 +3071,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
-    let request_tty = req.tty;
-    let no_login_shell = req.no_login_shell;
-    let execution_timeout = req
-        .execution_timeout
-        .as_ref()
-        .map(openshell_core::time::duration_to_std)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let (cols, rows) = pty_dimensions(req.cols, req.rows);
-
+    let prepared = PreparedExecRequest::try_from(req)?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
@@ -3116,22 +3088,9 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
             return;
         };
 
-        if let Err(err) = stream_interactive_exec_over_relay(
-            tx.clone(),
-            &sandbox_id,
-            &channel_id,
-            relay_stream,
-            &command_str,
-            input_stream,
-            request_tty,
-            no_login_shell,
-            execution_timeout,
-            cols,
-            rows,
-            completion,
-        )
-        .await
-        {
+        let exec = RelayExec::new(relay_stream, &sandbox_id, &channel_id, prepared, tx.clone())
+            .with_completion(completion);
+        if let Err(err) = exec.run_interactive(input_stream).await {
             warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandboxInteractive failed");
             let _ = tx.send(Err(err)).await;
         }
@@ -3424,162 +3383,201 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String>
     Ok(result)
 }
 
-/// Execute a command over an SSH transport relayed through a supervisor session.
+/// All execution settings prepared from a validated, authorized RPC request.
+/// Environment and working directory are encoded into `command`; sandbox
+/// identity and replay completion remain the caller's server-side context.
 ///
-/// This is the relay equivalent of `stream_exec_over_ssh`. Instead of dialing a
-/// sandbox endpoint directly, the SSH transport runs over a `DuplexStream` that
-/// is bridged to the supervisor's local SSH daemon via `RelayStream`.
-#[allow(clippy::too_many_arguments)]
-async fn stream_exec_over_relay(
-    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
-    sandbox_id: &str,
-    channel_id: &str,
-    relay_stream: tokio::io::DuplexStream,
-    command: &str,
+/// Convert before spawning the relay task so command/timeout errors remain RPC
+/// errors. This resolves PTY defaults and preserves zero/subsecond durations.
+struct PreparedExecRequest {
+    command: String,
     stdin_payload: Vec<u8>,
+    options: SshExecOptions,
     execution_timeout: Option<std::time::Duration>,
-    request_tty: bool,
-    no_login_shell: bool,
-    cols: u32,
-    rows: u32,
-    completion: Option<super::mutation_replay::Completion>,
-) -> Result<(), Status> {
-    let command_preview: String = command
-        .chars()
-        .take(120)
-        .flat_map(char::escape_default)
-        .collect();
-    info!(
-        sandbox_id = %sandbox_id,
-        channel_id = %channel_id,
-        command_len = command.len(),
-        stdin_len = stdin_payload.len(),
-        command_preview = %command_preview,
-        "ExecSandbox (relay): command started"
-    );
-
-    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
-        .await
-        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
-
-    let mut exec =
-        SshExec::new(local_proxy_port, command, tx.clone()).with_stdin_payload(stdin_payload);
-    if request_tty {
-        exec = exec.with_tty(cols, rows);
-    }
-    if !no_login_shell {
-        exec = exec.with_login_shell();
-    }
-    let exec = exec.run();
-
-    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
-    if matches!(exec_result, Ok(None)) {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        finish_interactive_exec_proxy(proxy_task).await;
-        return Ok(());
-    }
-
-    let exit_code = match exec_result {
-        Ok(Some(code)) => code,
-        Ok(None) => unreachable!("timeout returned above"),
-        Err(status) => {
-            finish_interactive_exec_proxy(proxy_task).await;
-            return Err(status);
-        }
-    };
-
-    finish_interactive_exec_proxy(proxy_task).await;
-
-    let _ = tx
-        .send(Ok(ExecSandboxEvent {
-            payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                ExecSandboxExit { exit_code },
-            )),
-        }))
-        .await;
-
-    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn stream_interactive_exec_over_relay(
-    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
-    sandbox_id: &str,
-    channel_id: &str,
+impl TryFrom<ExecSandboxRequest> for PreparedExecRequest {
+    type Error = Status;
+
+    fn try_from(req: ExecSandboxRequest) -> Result<Self, Self::Error> {
+        let command = build_remote_exec_command(&req)
+            .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+        let execution_timeout = req
+            .execution_timeout
+            .as_ref()
+            .map(openshell_core::time::duration_to_std)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (cols, rows) = pty_dimensions(req.cols, req.rows);
+        Ok(Self {
+            command,
+            stdin_payload: req.stdin,
+            options: SshExecOptions {
+                pty: req.tty.then_some(PtySize { cols, rows }),
+                login_shell: !req.no_login_shell,
+            },
+            execution_timeout,
+        })
+    }
+}
+
+/// A command executed over the supervisor's reverse-connected SSH relay.
+///
+/// `new` supplies all five required inputs, including the prepared request's
+/// command, stdin, SSH settings and timeout. Replay completion is optional.
+/// Polling `run` or `run_interactive` starts the proxy.
+#[must_use]
+struct RelayExec<'a> {
     relay_stream: tokio::io::DuplexStream,
-    command: &str,
-    input_stream: tonic::Streaming<ExecSandboxInput>,
-    request_tty: bool,
-    no_login_shell: bool,
+    sandbox_id: &'a str,
+    channel_id: &'a str,
+    request: PreparedExecRequest,
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    completion: Option<super::mutation_replay::Completion>,
+}
+
+impl<'a> RelayExec<'a> {
+    /// Supplies the required relay stream, sandbox/channel IDs for logging,
+    /// prepared execution request and output sender.
+    fn new(
+        relay_stream: tokio::io::DuplexStream,
+        sandbox_id: &'a str,
+        channel_id: &'a str,
+        request: PreparedExecRequest,
+        tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    ) -> Self {
+        Self {
+            relay_stream,
+            sandbox_id,
+            channel_id,
+            request,
+            tx,
+            completion: None,
+        }
+    }
+
+    /// Carries the optional server-side replay claim through execution. A real
+    /// SSH exit finalizes it before delivery; timeouts/errors leave it unresolved.
+    fn with_completion(mut self, completion: Option<super::mutation_replay::Completion>) -> Self {
+        self.completion = completion;
+        self
+    }
+
+    /// Sends the prepared request's buffered stdin and drains remote output.
+    async fn run(self) -> Result<(), Status> {
+        let PreparedExecRequest {
+            command,
+            stdin_payload,
+            options,
+            execution_timeout,
+        } = self.request;
+        let command_preview: String = command
+            .chars()
+            .take(120)
+            .flat_map(char::escape_default)
+            .collect();
+        info!(
+            sandbox_id = %self.sandbox_id,
+            channel_id = %self.channel_id,
+            command_len = command.len(),
+            stdin_len = stdin_payload.len(),
+            command_preview = %command_preview,
+            "ExecSandbox (relay): command started"
+        );
+
+        let (port, proxy_task) = start_single_use_ssh_proxy_over_relay(self.relay_stream)
+            .await
+            .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
+        let mut exec =
+            SshExec::new(port, &command, self.tx.clone()).with_stdin_payload(stdin_payload);
+        exec.options = options;
+        finish_relay_exec(
+            exec.run(),
+            proxy_task,
+            self.tx,
+            execution_timeout,
+            self.completion,
+        )
+        .await
+    }
+
+    /// Streams stdin and resize frames while draining remote output. The
+    /// input stream supplies stdin in place of the start request's payload.
+    async fn run_interactive<S>(self, input: S) -> Result<(), Status>
+    where
+        S: futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
+    {
+        let PreparedExecRequest {
+            command,
+            stdin_payload,
+            options,
+            execution_timeout,
+        } = self.request;
+        drop(stdin_payload);
+        let command_preview: String = command
+            .chars()
+            .take(120)
+            .flat_map(char::escape_default)
+            .collect();
+        info!(
+            sandbox_id = %self.sandbox_id,
+            channel_id = %self.channel_id,
+            command_len = command.len(),
+            command_preview = %command_preview,
+            "ExecSandboxInteractive (relay): command started"
+        );
+
+        let (port, proxy_task) = start_single_use_ssh_proxy_over_relay(self.relay_stream)
+            .await
+            .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
+        let mut exec = SshExec::new(port, &command, self.tx.clone()).with_input_stream(input);
+        exec.options = options;
+        finish_relay_exec(
+            exec.run(),
+            proxy_task,
+            self.tx,
+            execution_timeout,
+            self.completion,
+        )
+        .await
+    }
+}
+
+/// Preserves terminal-event ordering for both relay input modes. A genuine exit
+/// is finalized and the proxy cleaned up before delivery. A synthetic timeout
+/// emits exit 124 before cleanup and leaves replay unresolved. Errors clean up
+/// before returning to the RPC handler, which reports the error to the client.
+async fn finish_relay_exec(
+    exec: impl Future<Output = Result<i32, Status>>,
+    proxy_task: tokio::task::JoinHandle<()>,
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
     execution_timeout: Option<std::time::Duration>,
-    cols: u32,
-    rows: u32,
     completion: Option<super::mutation_replay::Completion>,
 ) -> Result<(), Status> {
-    let command_preview: String = command
-        .chars()
-        .take(120)
-        .flat_map(char::escape_default)
-        .collect();
-    info!(
-        sandbox_id = %sandbox_id,
-        channel_id = %channel_id,
-        command_len = command.len(),
-        command_preview = %command_preview,
-        "ExecSandboxInteractive (relay): command started"
-    );
-
-    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
-        .await
-        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
-
-    let mut exec =
-        SshExec::new(local_proxy_port, command, tx.clone()).with_input_stream(input_stream);
-    if request_tty {
-        exec = exec.with_tty(cols, rows);
-    }
-    if !no_login_shell {
-        exec = exec.with_login_shell();
-    }
-    let exec = exec.run();
-
-    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
-    if matches!(exec_result, Ok(None)) {
+    let send_exit = async |exit_code| {
         let _ = tx
             .send(Ok(ExecSandboxEvent {
                 payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
+                    ExecSandboxExit { exit_code },
                 )),
             }))
             .await;
-        finish_interactive_exec_proxy(proxy_task).await;
-        return Ok(());
-    }
+    };
 
-    let exit_code = match exec_result {
-        Ok(Some(code)) => code,
-        Ok(None) => unreachable!("timeout returned above"),
+    match wait_for_exec_terminal(exec, execution_timeout, completion).await {
+        Ok(Some(exit_code)) => {
+            finish_interactive_exec_proxy(proxy_task).await;
+            send_exit(exit_code).await;
+        }
+        Ok(None) => {
+            send_exit(124).await;
+            finish_interactive_exec_proxy(proxy_task).await;
+        }
         Err(status) => {
             finish_interactive_exec_proxy(proxy_task).await;
             return Err(status);
         }
-    };
-
-    finish_interactive_exec_proxy(proxy_task).await;
-
-    let _ = tx
-        .send(Ok(ExecSandboxEvent {
-            payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                ExecSandboxExit { exit_code },
-            )),
-        }))
-        .await;
+    }
 
     Ok(())
 }
@@ -3695,14 +3693,8 @@ impl<'a> SshExec<'a> {
     }
 }
 
+#[cfg(test)]
 impl<Input> SshExec<'_, Input> {
-    /// Requests a PTY using dimensions in character columns and rows. Callers
-    /// retain responsibility for resolving default dimensions before this call.
-    fn with_tty(mut self, cols: u32, rows: u32) -> Self {
-        self.options.pty = Some(PtySize { cols, rows });
-        self
-    }
-
     /// Enables login-shell startup files. The default non-login mode sends
     /// `OPENSHELL_NO_LOGIN_SHELL` and rejects supervisors lacking support for it.
     fn with_login_shell(mut self) -> Self {
