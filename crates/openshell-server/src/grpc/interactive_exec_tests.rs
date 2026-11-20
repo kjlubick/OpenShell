@@ -15,6 +15,7 @@ struct ExecPeer {
     eof: Arc<AtomicBool>,
     release_output: Arc<tokio::sync::Notify>,
     output_task: Option<tokio::task::JoinHandle<()>>,
+    exit_status: u32,
 }
 
 impl Drop for ExecPeer {
@@ -53,6 +54,7 @@ impl Handler for ExecPeer {
         if data == b"duplex" {
             let channel = self.channel.take().unwrap();
             let release = self.release_output.clone();
+            let exit_status = self.exit_status;
             let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<Vec<u8>>();
             self.echo_tx = Some(echo_tx);
             self.output_task = Some(tokio::spawn(async move {
@@ -65,7 +67,7 @@ impl Handler for ExecPeer {
                     writer.extended_data_bytes(1, data).await.unwrap();
                 }
                 release.notified().await;
-                writer.exit_status(7).await.unwrap();
+                writer.exit_status(exit_status).await.unwrap();
                 writer.close().await.unwrap();
             }));
         } else {
@@ -106,6 +108,7 @@ impl Handler for ExecPeer {
         }
         let release = self.release_output.clone();
         let handle = session.handle();
+        let exit_status = self.exit_status;
         self.output_task = Some(tokio::spawn(async move {
             release.notified().await;
             if handle.data(channel, b"after eof".to_vec()).await.is_err() {
@@ -114,7 +117,7 @@ impl Handler for ExecPeer {
             let _ = handle
                 .extended_data(channel, 1, b"stderr after eof".to_vec())
                 .await;
-            let _ = handle.exit_status_request(channel, 7).await;
+            let _ = handle.exit_status_request(channel, exit_status).await;
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
         }));
@@ -150,6 +153,11 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        // arbitrary exit code
+        Self::with_exit_status(7).await
+    }
+
+    async fn with_exit_status(exit_status: u32) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut config = russh::server::Config::default();
@@ -166,6 +174,7 @@ impl Fixture {
             eof: eof.clone(),
             release_output: release_output.clone(),
             output_task: None,
+            exit_status,
         };
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
@@ -183,6 +192,59 @@ impl Fixture {
             server,
         }
     }
+}
+
+// Windows STATUS_ACCESS_VIOLATION can be a process exit status after an
+// unhandled attempt to read, write, or execute inaccessible memory.
+// SSH sends the status as u32. The expected i32 exit code has the same
+// 32 bits interpreted as signed.
+const WINDOWS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const WINDOWS_ACCESS_VIOLATION_EXIT_CODE: i32 = -1_073_741_819;
+
+#[tokio::test]
+async fn exec_preserves_high_bit_ssh_exit_status() {
+    let fixture = Fixture::with_exit_status(WINDOWS_ACCESS_VIOLATION).await;
+    fixture.release_output.notify_one();
+    let (output_tx, _output_rx) = mpsc::channel(4);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_exec_with_russh(
+            fixture.port,
+            "test",
+            Vec::new(),
+            false,
+            false,
+            (0, 0),
+            output_tx,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), WINDOWS_ACCESS_VIOLATION_EXIT_CODE);
+}
+
+// Repeat the same exit-status check through the interactive SSH reader.
+#[tokio::test]
+async fn interactive_exec_preserves_high_bit_ssh_exit_status() {
+    let fixture = Fixture::with_exit_status(WINDOWS_ACCESS_VIOLATION).await;
+    fixture.release_output.notify_one();
+    let (output_tx, _output_rx) = mpsc::channel(4);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_interactive_exec_with_russh(
+            fixture.port,
+            "test",
+            futures::stream::empty(),
+            false,
+            false,
+            0,
+            0,
+            output_tx,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), WINDOWS_ACCESS_VIOLATION_EXIT_CODE);
 }
 
 async fn ready(rx: &mut mpsc::Receiver<Result<ExecSandboxEvent, Status>>) {
