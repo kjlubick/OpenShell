@@ -14,8 +14,9 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args,
-    shell_escape, validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, proxy_command_escape,
+    resolve_ssh_gateway, sandbox_ssh_args, shell_escape, validate_ssh_session_response,
+    write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
@@ -2126,13 +2127,13 @@ fn host_alias(name: &str, workspace: &str) -> String {
 
 fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
-    let exe = shell_escape(&exe.to_string_lossy());
+    let exe = proxy_command_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!(
         "{exe} ssh-proxy --gateway-name {} --name {} --workspace {}",
-        shell_escape(gateway),
-        shell_escape(name),
-        shell_escape(workspace),
+        proxy_command_escape(gateway),
+        proxy_command_escape(name),
+        proxy_command_escape(workspace),
     );
     let host_alias = host_alias(name, workspace);
     format!(
@@ -2790,9 +2791,17 @@ mod tests {
             config.contains("Host openshell-demo.beta"),
             "host alias should be workspace-qualified: {config}"
         );
+        // The ProxyCommand arguments are quoted for the host platform (a POSIX shell, or the
+        // Windows command-line parser), so build the expectation the same way production does.
+        let expected = format!(
+            "--gateway-name {} --name {} --workspace {}",
+            proxy_command_escape("my-gw"),
+            proxy_command_escape("demo"),
+            proxy_command_escape("beta"),
+        );
         assert!(
-            config.contains("--workspace beta"),
-            "ProxyCommand should include --workspace: {config}"
+            config.contains(&expected),
+            "ProxyCommand should carry the escaped gateway, name and workspace ({expected}): {config}"
         );
     }
 
@@ -3048,6 +3057,7 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+        assert_eq!(split_sandbox_path(r"/tmp/a\b"), ("/tmp", r"a\b"));
     }
 
     #[test]

@@ -925,26 +925,28 @@ impl russh::server::Handler for SshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         }
+        let command = String::from_utf8_lossy(data);
+        #[cfg(not(windows))]
+        let command = command.trim();
+        let command = command.to_string();
+        if command.is_empty() {
+            session.channel_success(channel)?;
+            return Ok(());
+        }
         #[cfg(windows)]
-        let result = {
-            let Some(payload) = data.strip_prefix(openshell_core::ssh_exec::ARGV_PREFIX.as_bytes())
-            else {
-                session.channel_failure(channel)?;
-                return Ok(());
-            };
+        let result = if let Some(payload) =
+            data.strip_prefix(openshell_core::ssh_exec::ARGV_PREFIX.as_bytes())
+        {
             self.start_mxc_argv(channel, session.handle(), payload)
                 .await
-        };
-        #[cfg(not(windows))]
-        let result = {
-            let command = String::from_utf8_lossy(data).trim().to_string();
-            if command.is_empty() {
-                session.channel_success(channel)?;
-                return Ok(());
-            }
+        } else {
             self.start_shell(channel, session.handle(), Some(command))
                 .await
         };
+        #[cfg(not(windows))]
+        let result = self
+            .start_shell(channel, session.handle(), Some(command))
+            .await;
         match result {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {

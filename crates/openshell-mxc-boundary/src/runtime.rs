@@ -909,10 +909,10 @@ impl BoundaryRuntime {
     }
 
     async fn start_exec(&self, envelope: &RequestEnvelope, spec: ExecSpecWire) -> Response {
-        if spec.shell.is_some() || spec.runtime_helper.is_some() {
+        if spec.runtime_helper.is_some() {
             return guest_error(
                 BoundaryErrorKind::Invalid,
-                "MXC does not support shell exec intent or runtime helpers",
+                "MXC does not support runtime helpers",
             );
         }
         if spec.pty {
@@ -1205,16 +1205,37 @@ struct WindowsLaunch {
     env: Vec<(String, String)>,
 }
 
-/// Resolve a Windows argv launch. Only an explicit cmd.exe command text
-/// argument uses cmd.exe's command-line parsing rules.
+/// Keep argv launches separate from native SSH shell commands. Only a
+/// caller that explicitly selects cmd.exe and supplies its command text can
+/// request cmd.exe evaluation from a structured exec request.
 fn windows_launch(spec: ExecSpecWire) -> Result<WindowsLaunch, &'static str> {
     let ExecSpecWire {
         program,
         args,
+        shell,
         env,
         workdir,
         ..
     } = spec;
+    if let Some(shell) = shell {
+        let (args, raw_command_tail) = shell.command.map_or_else(
+            || (vec!["/d".to_string(), "/q".to_string()], None),
+            |command| {
+                (
+                    vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
+                    Some(format!("\"{command}\"")),
+                )
+            },
+        );
+        return Ok(WindowsLaunch {
+            program: "cmd.exe".to_string(),
+            args,
+            raw_command_tail,
+            workdir,
+            env,
+        });
+    }
+
     if let Some(flag) = cmd_command_flag(&program, &args)
         && args.len() != flag + 2
     {
@@ -1769,17 +1790,46 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_sandbox_backend::boundary_protocol::ShellSpecWire;
 
-    fn argv_exec(program: &str, args: &[&str]) -> ExecSpecWire {
+    fn shell_exec(command: Option<&str>) -> ExecSpecWire {
         ExecSpecWire {
-            program: program.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-            shell: None,
+            program: String::new(),
+            args: Vec::new(),
+            shell: Some(ShellSpecWire {
+                command: command.map(str::to_string),
+                login: true,
+            }),
             runtime_helper: None,
             env: vec![("FROM_REQUEST".to_string(), "1".to_string())],
             workdir: Some(r"C:\default".to_string()),
             pty: false,
         }
+    }
+
+    #[test]
+    fn native_ssh_shell_text_reaches_cmd_unchanged() {
+        let native = r#""C:\Windows\System32\tool.exe" "a b""#;
+        let launch = windows_launch(shell_exec(Some(native))).unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/s", "/c"]);
+        assert_eq!(launch.raw_command_tail, Some(format!("\"{native}\"")));
+        assert_eq!(launch.workdir.as_deref(), Some(r"C:\default"));
+    }
+
+    #[test]
+    fn shell_without_command_starts_cmd() {
+        let launch = windows_launch(shell_exec(None)).unwrap();
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/q"]);
+    }
+
+    fn argv_exec(program: &str, args: &[&str]) -> ExecSpecWire {
+        let mut spec = shell_exec(None);
+        spec.shell = None;
+        spec.program = program.to_string();
+        spec.args = args.iter().map(|arg| (*arg).to_string()).collect();
+        spec
     }
 
     #[test]
