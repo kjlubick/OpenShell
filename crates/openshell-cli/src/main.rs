@@ -3753,24 +3753,28 @@ async fn run_async() -> Result<()> {
                                 let environment = run::parse_env_pairs(&envs)?;
                                 let gpu_requirements: Option<GpuResourceRequirements> =
                                     gpu.map(Into::into);
-                                run::sandbox_template_create(
-                                    endpoint,
-                                    &name,
-                                    image.as_deref(),
-                                    cpu.as_deref(),
-                                    memory.as_deref(),
+                                let options = run::SandboxTemplateCreateOptions {
+                                    image: image.as_deref(),
+                                    cpu: cpu.as_deref(),
+                                    memory: memory.as_deref(),
                                     gpu_requirements,
-                                    driver_config_json.as_deref(),
-                                    ready_within.as_deref(),
+                                    driver_config_json: driver_config_json.as_deref(),
+                                    ready_within: ready_within.as_deref(),
                                     max_burst,
                                     labels,
                                     annotations,
                                     environment,
-                                    output.as_str(),
+                                    suppress_credential_warnings: no_credential_warnings,
+                                };
+                                run::SandboxTemplateCreate::new(
+                                    endpoint,
                                     &cli.workspace,
                                     &tls,
-                                    no_credential_warnings,
+                                    &name,
+                                    output.as_str(),
                                 )
+                                .with_options(options)
+                                .run()
                                 .await?;
                             }
                             SandboxTemplateCommands::Get { name, output } => {

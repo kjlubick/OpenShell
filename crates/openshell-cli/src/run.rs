@@ -3358,25 +3358,106 @@ fn sandbox_detail_to_json(
     Ok(value)
 }
 
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn sandbox_template_create(
-    server: &str,
-    name: &str,
-    image: Option<&str>,
-    cpu: Option<&str>,
-    memory: Option<&str>,
-    gpu_requirements: Option<GpuResourceRequirements>,
-    driver_config_json: Option<&str>,
-    ready_within: Option<&str>,
-    max_burst: Option<u32>,
-    labels: HashMap<String, String>,
-    annotations: HashMap<String, String>,
-    environment: HashMap<String, String>,
-    output: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-    suppress_credential_warnings: bool,
-) -> Result<()> {
+/// Optional workload settings and metadata for template creation.
+///
+/// Resources are independent. Unset values retain the gateway's defaults, and
+/// explicit values such as `Some(0)` remain present.
+#[derive(Default)]
+pub struct SandboxTemplateCreateOptions<'a> {
+    /// Workload image; omission lets the gateway choose its default.
+    pub image: Option<&'a str>,
+    /// CPU quantity, validated before connecting to the gateway.
+    pub cpu: Option<&'a str>,
+    /// Memory quantity, validated before connecting to the gateway.
+    pub memory: Option<&'a str>,
+    /// GPU requirements, independent of CPU and memory.
+    pub gpu_requirements: Option<GpuResourceRequirements>,
+    /// Driver-specific JSON, parsed before connecting to the gateway.
+    pub driver_config_json: Option<&'a str>,
+    /// Readiness target in the CLI's duration syntax, such as `30s`.
+    pub ready_within: Option<&'a str>,
+    /// Startup burst limit; an explicit zero remains present.
+    pub max_burst: Option<u32>,
+    /// Template metadata labels.
+    pub labels: HashMap<String, String>,
+    /// Template metadata annotations.
+    pub annotations: HashMap<String, String>,
+    /// Workload environment variables.
+    pub environment: HashMap<String, String>,
+    /// Suppress credential-variable warnings, which are enabled by default.
+    pub suppress_credential_warnings: bool,
+}
+
+/// Create a workload template.
+///
+/// The gateway endpoint, workspace, TLS/authentication options, name and output
+/// format are required. Workload settings and metadata are optional.
+#[must_use]
+pub struct SandboxTemplateCreate<'a> {
+    server: &'a str,
+    workspace: &'a str,
+    tls: &'a TlsOptions,
+    name: &'a str,
+    output: &'a str,
+    options: SandboxTemplateCreateOptions<'a>,
+}
+
+impl<'a> SandboxTemplateCreate<'a> {
+    /// Supplies every required input.
+    ///
+    /// Configuration performs no I/O; `run` validates resources and service
+    /// levels before connecting to the gateway.
+    pub fn new(
+        server: &'a str,
+        workspace: &'a str,
+        tls: &'a TlsOptions,
+        name: &'a str,
+        output: &'a str,
+    ) -> Self {
+        Self {
+            server,
+            workspace,
+            tls,
+            name,
+            output,
+            options: SandboxTemplateCreateOptions::default(),
+        }
+    }
+
+    /// Supplies optional workload settings and metadata together.
+    pub fn with_options(mut self, options: SandboxTemplateCreateOptions<'a>) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Validates and sends the template, then renders the requested output.
+    pub async fn run(self) -> Result<()> {
+        create_sandbox_template(self).await
+    }
+}
+
+async fn create_sandbox_template(create: SandboxTemplateCreate<'_>) -> Result<()> {
+    let SandboxTemplateCreate {
+        server,
+        workspace,
+        tls,
+        name,
+        output,
+        options,
+    } = create;
+    let SandboxTemplateCreateOptions {
+        image,
+        cpu,
+        memory,
+        gpu_requirements,
+        driver_config_json,
+        ready_within,
+        max_burst,
+        labels,
+        annotations,
+        environment,
+        suppress_credential_warnings,
+    } = options;
     let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
         Some(SandboxResources {
             cpu: cpu

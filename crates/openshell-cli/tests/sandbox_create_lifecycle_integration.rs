@@ -2156,26 +2156,25 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
         .run_async(async {
             let tls = test_tls(&server);
 
-            run::sandbox_template_create(
-                &server.endpoint,
-                "gpu-kata",
-                Some("registry.example.com/agent:latest"),
-                Some("2"),
-                Some("4Gi"),
-                Some(GpuResourceRequirements { count: Some(1) }),
-                Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
-                Some("5m"),
-                Some(3),
-                HashMap::from([("team".to_string(), "runtime".to_string())]),
-                HashMap::from([("owner".to_string(), "platform".to_string())]),
-                HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
-                "table",
-                "team-a",
-                &tls,
-                true,
-            )
-            .await
-            .expect("template create should succeed");
+            run::SandboxTemplateCreate::new(&server.endpoint, "team-a", &tls, "gpu-kata", "table")
+                .with_options(run::SandboxTemplateCreateOptions {
+                    image: Some("registry.example.com/agent:latest"),
+                    cpu: Some("2"),
+                    memory: Some("4Gi"),
+                    gpu_requirements: Some(GpuResourceRequirements { count: Some(1) }),
+                    driver_config_json: Some(
+                        r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#,
+                    ),
+                    ready_within: Some("5m"),
+                    max_burst: Some(3),
+                    labels: HashMap::from([("team".to_string(), "runtime".to_string())]),
+                    annotations: HashMap::from([("owner".to_string(), "platform".to_string())]),
+                    environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
+                    suppress_credential_warnings: true,
+                })
+                .run()
+                .await
+                .expect("template create should succeed");
 
             let requests = template_create_requests(&server).await;
             let request = requests
@@ -2291,26 +2290,14 @@ async fn sandbox_template_create_allows_omitted_image() {
         .run_async(async {
             let tls = test_tls(&server);
 
-            run::sandbox_template_create(
-                &server.endpoint,
-                "base",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                "table",
-                "default",
-                &tls,
-                true,
-            )
-            .await
-            .expect("template create without image should succeed");
+            run::SandboxTemplateCreate::new(&server.endpoint, "default", &tls, "base", "table")
+                .with_options(run::SandboxTemplateCreateOptions {
+                    suppress_credential_warnings: true,
+                    ..Default::default()
+                })
+                .run()
+                .await
+                .expect("template create without image should succeed");
 
             let requests = template_create_requests(&server).await;
             let request = requests
