@@ -64,7 +64,7 @@ use openshell_ocsf::{
 ///
 /// The singleton lives in `openshell-ocsf` so both supervisor leaves can
 /// reach it without depending on `openshell-sandbox`. Initialised once during
-/// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
+/// `SandboxRun::run()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
 /// The sandbox rejected the image working directory while starting the agent.
@@ -653,75 +653,52 @@ pub async fn run_network_proxy(
     }
 }
 
-/// Run a command in the sandbox.
+/// Required inputs for supervising one admitted sandbox generation.
 ///
-/// # Errors
-///
-/// Returns an error if the command fails to start or encounters a fatal error.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::implicit_hasher,
-    clippy::similar_names,
-    clippy::fn_params_excessive_bools
-)]
-pub async fn run_sandbox(
-    command: Vec<String>,
-    workdir: Option<String>,
-    timeout_secs: u64,
-    interactive: bool,
-    await_main_process_attachment: bool,
-    sandbox_id: Option<String>,
-    sandbox: Option<String>,
-    openshell_endpoint: Option<String>,
-    policy_rules: Option<String>,
-    policy_data: Option<String>,
-    ssh_socket_path: Option<String>,
-    health_socket_path: Option<std::path::PathBuf>,
-    health_port: Option<u16>,
-    ocsf_enabled: Arc<AtomicBool>,
-    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
-    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
-    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    admitted_isolation_backend: Option<String>,
-    main_exit_marker: Option<std::path::PathBuf>,
-) -> Result<i32> {
-    // Shared startup retains policy and networking state; box it to keep callers' futures small.
-    Box::pin(run_sandbox_with_backend(
-        backend_setup::platform_setup(),
-        SandboxRunConfig {
-            command,
-            workdir,
-            timeout_secs,
-            interactive,
-            await_main_process_attachment,
-            sandbox_id,
-            sandbox,
-            openshell_endpoint,
-            policy_rules,
-            policy_data,
-            ssh_socket_path,
-            health_socket_path,
-            health_port,
-            ocsf_enabled,
-            ocsf_schema_version,
-            upstream_proxy_args,
-            backend_descriptor,
-            auth_bundle,
-            admitted_isolation_backend,
-            main_exit_marker,
-        },
-    ))
-    .await
+/// Supply every field to [`SandboxRun::new`]. An empty command is the existing
+/// scratch-sandbox sentinel. Identity and admission come from trusted launch
+/// inputs; the caller must reject missing external values before construction.
+/// Optional startup settings use the builder's methods.
+pub struct SandboxRunArgs {
+    /// Workload program and arguments, or the empty scratch-sandbox sentinel.
+    pub command: Vec<String>,
+    /// Admitted sandbox identity checked against the runtime descriptor.
+    pub sandbox_id: String,
+    /// Admitted isolation-backend name checked before decoding its payload.
+    pub admitted_backend: String,
+    /// Encoded runtime contract for the selected isolation backend.
+    pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
+    /// Trusted credentials for this supervisor session and runtime generation.
+    pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
+    /// Caller-shared switch controlling structured event logging.
+    pub ocsf_enabled: Arc<AtomicBool>,
+    /// Caller-shared selected OCSF schema version.
+    pub ocsf_schema_version: Arc<std::sync::Mutex<String>>,
 }
 
-struct SandboxRunConfig {
+/// Whether SSH access must wait for a client to attach to the main process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentMode {
+    /// Start the main process without waiting for an attachment.
+    DoNotWait,
+    /// Wait for a client to attach through the supported SSH access adapter.
+    WaitForMain,
+}
+
+/// Supervise a sandbox with optional policy, access and health configuration.
+///
+/// All required inputs are supplied to [`Self::new`]. Defaults are no workdir or
+/// timeout, non-interactive execution, no attachment wait, no local policy or
+/// gateway overrides, no health endpoints and no upstream-proxy overrides.
+/// Configuration performs no I/O; polling [`Self::run`] starts supervision.
+#[must_use]
+pub struct SandboxRun {
     command: Vec<String>,
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
     await_main_process_attachment: bool,
-    sandbox_id: Option<String>,
+    sandbox_id: String,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
@@ -734,8 +711,125 @@ struct SandboxRunConfig {
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    admitted_isolation_backend: Option<String>,
+    admitted_isolation_backend: String,
     main_exit_marker: Option<std::path::PathBuf>,
+}
+
+impl SandboxRun {
+    /// Supplies all seven required startup inputs as named fields. Retains the
+    /// caller's OCSF controls rather than creating independent logging state.
+    pub fn new(args: SandboxRunArgs) -> Self {
+        Self {
+            command: args.command,
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            await_main_process_attachment: false,
+            sandbox_id: args.sandbox_id,
+            sandbox: None,
+            openshell_endpoint: None,
+            policy_rules: None,
+            policy_data: None,
+            ssh_socket_path: None,
+            health_socket_path: None,
+            health_port: None,
+            ocsf_enabled: args.ocsf_enabled,
+            ocsf_schema_version: args.ocsf_schema_version,
+            upstream_proxy_args:
+                openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            backend_descriptor: args.backend_descriptor,
+            auth_bundle: args.auth_bundle,
+            admitted_isolation_backend: args.admitted_backend,
+            main_exit_marker: None,
+        }
+    }
+
+    /// Sets the optional workload directory; `None` leaves selection to the runtime.
+    pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
+        self.workdir = workdir;
+        self
+    }
+
+    /// Sets the workload timeout in whole seconds. Zero means no timeout.
+    pub fn with_timeout_s(mut self, seconds: u64) -> Self {
+        self.timeout_secs = seconds;
+        self
+    }
+
+    /// Enables interactive execution using the existing process-group behavior.
+    pub fn with_interactive_terminal(mut self) -> Self {
+        self.interactive = true;
+        self
+    }
+
+    /// Sets the sandbox name used for gateway activation and structured logs.
+    pub fn with_sandbox_name(mut self, name: Option<String>) -> Self {
+        self.sandbox = name;
+        self
+    }
+
+    /// Sets the gateway endpoint for activation, updates and status reporting.
+    pub fn with_gateway_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.openshell_endpoint = endpoint;
+        self
+    }
+
+    /// Selects the local Rego rules and policy-data files together. Startup
+    /// rejects combining this pair with gateway-managed policy activation.
+    pub fn with_local_policy(mut self, rules: String, data: String) -> Self {
+        self.policy_rules = Some(rules);
+        self.policy_data = Some(data);
+        self
+    }
+
+    /// Enables the SSH access adapter and chooses its main-process attachment
+    /// behavior. Startup validates adapter availability on the current host.
+    pub fn with_ssh_access(mut self, socket_path: String, attachment: AttachmentMode) -> Self {
+        self.ssh_socket_path = Some(socket_path);
+        self.await_main_process_attachment = attachment == AttachmentMode::WaitForMain;
+        self
+    }
+
+    /// Sets the optional Unix health/readiness socket independently of TCP.
+    pub fn with_health_socket(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.health_socket_path = path;
+        self
+    }
+
+    /// Sets the optional TCP health/readiness port independently of a Unix socket.
+    pub fn with_health_port(mut self, port: Option<u16>) -> Self {
+        self.health_port = port;
+        self
+    }
+
+    /// Supplies the existing grouped upstream-proxy configuration.
+    pub fn with_upstream_proxy(
+        mut self,
+        proxy: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    ) -> Self {
+        self.upstream_proxy_args = proxy;
+        self
+    }
+
+    /// Sets the optional file used to publish the main process exit status.
+    pub fn with_main_exit_marker(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.main_exit_marker = path;
+        self
+    }
+
+    /// Starts the admitted workload and returns its existing exit status.
+    ///
+    /// # Errors
+    ///
+    /// Returns startup validation, policy, backend and fatal runtime failures.
+    pub async fn run(self) -> Result<i32> {
+        // Shared startup retains policy and networking state; box it to keep callers' futures small.
+        Box::pin(run_sandbox_with_backend(
+            backend_setup::platform_setup(),
+            self,
+        ))
+        .await
+    }
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
@@ -743,9 +837,9 @@ struct SandboxRunConfig {
 #[allow(clippy::similar_names)]
 async fn run_sandbox_with_backend(
     backend_setup: &dyn backend_setup::BackendSetup,
-    config: SandboxRunConfig,
+    run: SandboxRun,
 ) -> Result<i32> {
-    let SandboxRunConfig {
+    let SandboxRun {
         command,
         workdir,
         timeout_secs,
@@ -766,7 +860,7 @@ async fn run_sandbox_with_backend(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
-    } = config;
+    } = run;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
     if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
@@ -793,7 +887,7 @@ async fn run_sandbox_with_backend(
         );
 
         if !openshell_ocsf::ctx::set_ctx(EventContext {
-            sandbox_id: sandbox_id.clone().unwrap_or_default(),
+            sandbox_id: sandbox_id.clone(),
             sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
             container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
             hostname,
@@ -814,8 +908,8 @@ async fn run_sandbox_with_backend(
     let selected_backend = backend_setup::SelectedBackend::select(
         backend_setup,
         backend_descriptor,
-        admitted_isolation_backend.as_deref(),
-        sandbox_id.as_deref(),
+        Some(admitted_isolation_backend.as_str()),
+        Some(sandbox_id.as_str()),
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
@@ -840,7 +934,7 @@ async fn run_sandbox_with_backend(
     // one, and ends once the access plane is up.
     let startup = tracing::info_span!(
         "supervisor.startup",
-        sandbox.id = sandbox_id.as_deref().unwrap_or_default(),
+        sandbox.id = sandbox_id.as_str(),
         otel.status_code = tracing::field::Empty,
     );
     openshell_otel::set_parent_from_environment(&startup);
@@ -875,7 +969,7 @@ async fn run_sandbox_with_backend(
         initial_extension_authentication_enabled,
         captured_provider_environment,
     ) = load_policy_with_gateway(
-        sandbox_id.clone(),
+        Some(sandbox_id.clone()),
         sandbox.clone(),
         openshell_endpoint.clone(),
         policy_rules,
@@ -907,8 +1001,8 @@ async fn run_sandbox_with_backend(
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
         // even if provider env fetch fails (graceful degradation).
-        let environment = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id)
+        let environment = if let Some(endpoint) = &openshell_endpoint {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, &sandbox_id)
                 .instrument(startup.clone())
                 .await
             {
@@ -1014,50 +1108,31 @@ async fn run_sandbox_with_backend(
     // produce DenialEvents that the denial aggregator (orchestrator-side)
     // consumes via the matching receiver. Both leaves are pure producers;
     // the orchestrator owns the consumer task spawned below.
-    let (denial_tx, denial_rx): (Option<UnboundedSender<DenialEvent>>, _) = if sandbox_id.is_some()
-    {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let (denial_tx, denial_rx) = tokio::sync::mpsc::unbounded_channel::<DenialEvent>();
 
     // Anonymous activity channel: same orchestrator-owned pattern as the
     // denial channel. The proxy and the bypass monitor both emit per-event
     // activity records; the orchestrator-side aggregator drains, sanitizes,
     // and flushes anonymous summaries to the gateway.
-    let (activity_tx, activity_rx) = if sandbox_id.is_some() {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let (activity_tx, activity_rx) =
+        tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
 
     // Endpoint observations are bounded and never backpressure proxied traffic.
     // Reports are authorized by the currently accepted supervisor session.
-    let (endpoint_observation_tx, endpoint_status_rx) = if sandbox_id.is_some() {
-        let (sender, receiver) = openshell_core::endpoint_status::endpoint_status_channel();
-        (Some(sender), Some(receiver))
-    } else {
-        (None, None)
-    };
+    let (endpoint_observation_tx, endpoint_status_rx) =
+        openshell_core::endpoint_status::endpoint_status_channel();
     let (supervisor_session_updates, supervisor_session_id) =
         tokio::sync::watch::channel::<Option<String>>(None);
     if let (
-        Some(sender),
         Some(proto),
         LoadedPolicyOrigin::Gateway {
             revision: Some(revision),
             ..
         },
-    ) = (
-        endpoint_observation_tx.as_ref(),
-        retained_proto.as_ref(),
-        &loaded_policy_origin,
-    ) {
+    ) = (retained_proto.as_ref(), &loaded_policy_origin)
+    {
         endpoint_status::reset(
-            Some(sender),
+            Some(&endpoint_observation_tx),
             Some(proto),
             &revision.policy_hash,
             provider_credentials.snapshot().revision,
@@ -1098,12 +1173,12 @@ async fn run_sandbox_with_backend(
             // unnecessarily delay DNS and network readiness.
             false,
             &provider_credentials,
-            sandbox_id.as_deref(),
+            Some(sandbox_id.as_str()),
             sandbox_name_for_agg.as_deref(),
             openshell_endpoint_for_proxy.as_deref(),
-            denial_tx,
-            activity_tx,
-            endpoint_observation_tx.clone(),
+            Some(denial_tx),
+            Some(activity_tx),
+            Some(endpoint_observation_tx.clone()),
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
@@ -1130,20 +1205,19 @@ async fn run_sandbox_with_backend(
     // Spawn the denial-aggregator flush task. The aggregator drains proxy
     // denial events, batches them, and ships summaries to the gateway via
     // `SubmitPolicyAnalysis`.
-    if let (Some(rx), Some(endpoint)) = (denial_rx, openshell_endpoint_for_proxy.as_deref()) {
+    if let Some(endpoint) = openshell_endpoint_for_proxy.as_deref() {
         // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID — fall
         // back to the ID when the name isn't set.
         let agg_name = sandbox_name_for_agg
             .clone()
-            .or_else(|| sandbox_id.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| sandbox_id.clone());
         let agg_endpoint = endpoint.to_string();
         let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
 
-        let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+        let aggregator = denial_aggregator::DenialAggregator::new(denial_rx, flush_interval_secs);
         let denial_workspace_gate = workspace_rx.clone();
         let denial_workspace_rx = workspace_rx.clone();
 
@@ -1171,16 +1245,18 @@ async fn run_sandbox_with_backend(
                 )
                 .await;
         });
+    } else {
+        // Close now so producers do not retain events without a gateway consumer.
+        drop(denial_rx);
     }
 
     // Spawn the activity-aggregator flush task. The aggregator drains
     // anonymous activity events from the proxy, sanitizes deny groups,
     // and ships periodic summaries to the gateway.
-    if let (Some(rx), Some(endpoint)) = (activity_rx, openshell_endpoint_for_proxy.as_deref()) {
+    if let Some(endpoint) = openshell_endpoint_for_proxy.as_deref() {
         let agg_name = sandbox_name_for_agg
             .clone()
-            .or_else(|| sandbox_id.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| sandbox_id.clone());
         let agg_endpoint = endpoint.to_string();
         let flush_interval_secs = activity_aggregator::activity_flush_interval_secs_from_env(
             std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
@@ -1188,7 +1264,8 @@ async fn run_sandbox_with_backend(
                 .as_deref(),
         );
 
-        let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+        let aggregator =
+            activity_aggregator::ActivityAggregator::new(activity_rx, flush_interval_secs);
         let activity_workspace_gate = workspace_rx.clone();
         let activity_workspace_rx = workspace_rx.clone();
 
@@ -1216,16 +1293,18 @@ async fn run_sandbox_with_backend(
                 )
                 .await;
         });
+    } else {
+        // Close now so producers do not retain events without a gateway consumer.
+        drop(activity_rx);
     }
 
     // Spawn background policy poll task (gRPC mode only).
-    if let (Some(id), Some(sandbox), Some(endpoint), Some(engine)) = (
-        sandbox_id.as_deref(),
+    if let (Some(sandbox), Some(endpoint), Some(engine)) = (
         sandbox.as_deref(),
         openshell_endpoint.as_deref(),
         opa_engine.as_ref(),
     ) {
-        let poll_id = id.to_string();
+        let poll_id = sandbox_id.clone();
         let poll_sandbox = sandbox.to_string();
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
@@ -1266,8 +1345,8 @@ async fn run_sandbox_with_backend(
                 capable: transparent_tcp_capable,
                 substrate_ready: transparent_tcp_substrate_ready,
             },
-            endpoint_observation_tx,
-            endpoint_status_rx,
+            endpoint_observation_tx: Some(endpoint_observation_tx),
+            endpoint_status_rx: Some(endpoint_status_rx),
             endpoint_policy: poll_endpoint_policy,
             supervisor_session_id: supervisor_session_id.clone(),
         };
@@ -1315,7 +1394,7 @@ async fn run_sandbox_with_backend(
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
-            sandbox_id.as_deref(),
+            Some(sandbox_id.as_str()),
             openshell_endpoint.as_deref(),
             ssh_socket_path.as_deref(),
             shared_ssh_socket_from_env(),
@@ -1333,19 +1412,15 @@ async fn run_sandbox_with_backend(
         info!(backend = %backend_name, "Control-mode access plane started");
         startup_status.finish(Ok::<_, ()>(())).ok();
         drop(startup);
-        let _provider_reporter =
-            sandbox_id
-                .as_ref()
-                .zip(openshell_endpoint.as_ref())
-                .map(|(id, endpoint)| {
-                    provider_readiness.start_reporter(
-                        endpoint.clone(),
-                        id.clone(),
-                        provider_credentials.clone(),
-                        supervisor_session_id.clone(),
-                        running.exec(),
-                    )
-                });
+        let _provider_reporter = openshell_endpoint.as_ref().map(|endpoint| {
+            provider_readiness.start_reporter(
+                endpoint.clone(),
+                sandbox_id.clone(),
+                provider_credentials.clone(),
+                supervisor_session_id.clone(),
+                running.exec(),
+            )
+        });
         let mut control_readiness = health_socket_path
             .map(ReadinessEndpoint::Unix)
             .into_iter()
@@ -1418,13 +1493,10 @@ async fn run_sandbox_with_backend(
                 .into_diagnostic()
                 .wrap_err("persist canonical-process completion marker")?;
         }
-        if !completion_cancelled
-            && let (Some(endpoint), Some(id)) =
-                (openshell_endpoint.as_deref(), sandbox_id.as_deref())
-        {
+        if !completion_cancelled && let Some(endpoint) = openshell_endpoint.as_deref() {
             let report = openshell_supervisor_process::delegated::report_main_process_exit(
                 endpoint,
-                id,
+                &sandbox_id,
                 &instance_id,
                 exit_code,
             );
@@ -1436,13 +1508,10 @@ async fn run_sandbox_with_backend(
             completion_cancelled =
                 completion_phase_or_shutdown(drain, shutdown_requested.as_mut()).await;
         }
-        if !completion_cancelled
-            && let (Some(endpoint), Some(id)) =
-                (openshell_endpoint.as_deref(), sandbox_id.as_deref())
-        {
+        if !completion_cancelled && let Some(endpoint) = openshell_endpoint.as_deref() {
             let finalize = openshell_supervisor_process::delegated::finalize_main_process_exit(
                 endpoint,
-                id,
+                &sandbox_id,
                 &instance_id,
             );
             completion_cancelled =
@@ -5233,61 +5302,6 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Admission must reject this input before any backend decodes its payload
-    /// or contacts a workload. Keep this fixture independent of setup helpers
-    /// so it can also reproduce the ordering defect on earlier revisions.
-    #[tokio::test]
-    async fn startup_rejects_missing_admission_before_decoding_payload() {
-        let auth_bundle = openshell_core::jwt::SupervisorAuthBundle {
-            session_id: openshell_core::SandboxSessionId::new(),
-            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                "generation-1",
-            )
-            .expect("generation"),
-            session_rotation: openshell_core::jwt::SessionRotation::new(1).expect("rotation"),
-            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("epoch"),
-            gateway_token: openshell_core::jwt::SecretJwt::parse("test-gateway-token")
-                .expect("token"),
-            gateway_expires_at: 0,
-            sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token")
-                .expect("token"),
-            sandbox_expires_at: 0,
-            ssh_host_private_key: None,
-        };
-        let error = run_sandbox(
-            vec!["true".to_string()],
-            None,
-            0,
-            false,
-            false,
-            Some("sandbox-1".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(String::new())),
-            openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
-            openshell_isolation_interface::contract::BackendDescriptor {
-                backend_name: "in-process-test".to_string(),
-                payload: b"in-process-only-launch-data".to_vec(),
-            },
-            auth_bundle,
-            None,
-            None,
-        )
-        .await
-        .expect_err("missing admission cannot authorize startup");
-
-        assert_eq!(
-            error.to_string(),
-            "runtime descriptor supplied without an admitted isolation backend"
-        );
-    }
 
     fn effective_bool(value: bool) -> openshell_core::proto::EffectiveSetting {
         openshell_core::proto::EffectiveSetting {

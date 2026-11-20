@@ -303,7 +303,7 @@ fn main() -> Result<()> {
         let descriptor = backend_descriptor(&args, admitted_isolation_backend.as_deref())?;
         let auth = auth_bundle(&args)?;
         // Install the driver-provisioned session before starting log push or
-        // any other gateway client. `run_sandbox` obtains the same Sandbox
+        // any other gateway client. `SandboxRun` obtains the same Sandbox
         // Protocol bearer slot after validating the descriptor binding.
         let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
         Some((descriptor, auth))
@@ -416,31 +416,53 @@ fn main() -> Result<()> {
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
-                let admitted_isolation_backend =
-                    std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                let result = Box::pin(openshell_supervisor::run_sandbox(
-                    command,
-                    workdir,
-                    args.timeout,
-                    interactive,
-                    await_main_process_attachment,
-                    args.sandbox_id,
-                    args.sandbox,
-                    args.openshell_endpoint,
-                    args.policy_rules,
-                    args.policy_data,
-                    args.ssh_socket_path,
-                    args.health_socket_path,
-                    args.health_port,
-                    ocsf_enabled,
-                    ocsf_schema_version,
-                    upstream_proxy_args,
-                    backend_descriptor,
-                    auth_bundle,
-                    admitted_isolation_backend,
-                    args.main_exit_marker,
-                ))
-                .await;
+                if await_main_process_attachment && (!cfg!(unix) || args.ssh_socket_path.is_none()) {
+                    return Err(miette::miette!(
+                        "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
+                    ));
+                }
+                let admitted_backend = admitted_isolation_backend.ok_or_else(|| {
+                    miette::miette!(
+                        "runtime descriptor supplied without an admitted isolation backend"
+                    )
+                })?;
+                let sandbox_id = args.sandbox_id.ok_or_else(|| {
+                    miette::miette!("runtime descriptor does not match admitted sandbox")
+                })?;
+                let mut run = openshell_supervisor::SandboxRun::new(
+                    openshell_supervisor::SandboxRunArgs {
+                        command,
+                        sandbox_id,
+                        admitted_backend,
+                        backend_descriptor,
+                        auth_bundle,
+                        ocsf_enabled,
+                        ocsf_schema_version,
+                    },
+                )
+                .with_workdir(workdir)
+                .with_timeout_s(args.timeout)
+                .with_sandbox_name(args.sandbox)
+                .with_gateway_endpoint(args.openshell_endpoint)
+                .with_health_socket(args.health_socket_path)
+                .with_health_port(args.health_port)
+                .with_upstream_proxy(upstream_proxy_args)
+                .with_main_exit_marker(args.main_exit_marker);
+                if interactive {
+                    run = run.with_interactive_terminal();
+                }
+                if let (Some(rules), Some(data)) = (args.policy_rules, args.policy_data) {
+                    run = run.with_local_policy(rules, data);
+                }
+                if let Some(socket) = args.ssh_socket_path {
+                    let attachment = if await_main_process_attachment {
+                        openshell_supervisor::AttachmentMode::WaitForMain
+                    } else {
+                        openshell_supervisor::AttachmentMode::DoNotWait
+                    };
+                    run = run.with_ssh_access(socket, attachment);
+                }
+                let result = Box::pin(run.run()).await;
                 supervisor_exit(result)
             }
             SupervisorRole::NetworkProxy => {

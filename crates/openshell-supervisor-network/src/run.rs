@@ -161,13 +161,12 @@ fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) ->
     Ok(epoch)
 }
 
-/// Handles and values produced by [`run_networking`] that the rest of
-/// `run_sandbox` consumes.
+/// Handles and values produced by [`run_networking`] for supervisor startup.
 ///
 /// The `proxy` field is an RAII handle whose drop tears down the proxy
 /// task. It must remain alive for the duration of the sandbox wait loop,
 /// which is achieved by holding the returned `Networking` value in
-/// `run_sandbox`'s frame.
+/// the supervisor startup future.
 pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
@@ -186,7 +185,7 @@ pub struct Networking {
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
 /// and the SSH-side proxy URL / netns FD.
 ///
-/// The network namespace is created by `run_sandbox` and borrowed in here —
+/// The network namespace is created during supervisor startup and borrowed here —
 /// it is shared infrastructure used by both the proxy (bind address) and
 /// the workload child (entered via `setns()` in `pre_exec`).
 ///

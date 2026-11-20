@@ -800,13 +800,13 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     let startup = |await_main_process_attachment| {
         Box::pin(crate::run_sandbox_with_backend(
             &setup,
-            crate::SandboxRunConfig {
+            crate::SandboxRun {
                 command: vec!["test-agent".into(), "test-argument".into()],
                 workdir: Some("/test-workspace".into()),
                 timeout_secs: 15,
                 interactive: false,
                 await_main_process_attachment,
-                sandbox_id: Some(setup.sandbox_id.clone()),
+                sandbox_id: setup.sandbox_id.clone(),
                 sandbox: None,
                 openshell_endpoint: None,
                 policy_rules: Some(rules.to_string_lossy().into_owned()),
@@ -819,7 +819,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 upstream_proxy_args: UpstreamProxyArgs::default(),
                 backend_descriptor: TestSetup::descriptor(),
                 auth_bundle: setup.auth.clone(),
-                admitted_isolation_backend: Some(TEST_BACKEND.into()),
+                admitted_isolation_backend: TEST_BACKEND.into(),
                 main_exit_marker: Some(marker.clone()),
             },
         ))

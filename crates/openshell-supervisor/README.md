@@ -4,7 +4,7 @@ The supervisor loads and reconciles policy, maintains provider credentials, appl
 
 ## Backend startup
 
-The public `run_sandbox` entry point selects the platform backend and collects its startup inputs into a private `SandboxRunConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns the selected backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
+The public `SandboxRun::new(SandboxRunArgs { ... })` entry point takes all seven required startup inputs as named fields and retains the caller-shared OCSF controls. Optional fluent methods configure the workload, grouped local-policy files, SSH access and attachment mode, gateway access, proxy settings and independent health endpoints. `SandboxRun` stores these startup settings directly. `SandboxRun::run` selects the platform backend and passes the operation and trusted backend setup to shared startup. The `backend_setup` module owns the selected backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
 
 Windows composition selects MXC; other platforms retain the standard OpenShell Sandbox Protocol backend. The MXC setup retains one reverse-TCP connector through discovery, attachment, and reconnects, and builds the host-side isolation backend with its Windows audit validator. Provisioning remains in the compute driver; supervision remains in a separate host process.
 
@@ -16,7 +16,7 @@ The supervisor admits policy and prepares credentials before constructing and at
 
 The client receives the supervisor's live provider state, bearer-token slot, and CA-path slot. Provider refresh, token rotation, and later CA publication must remain visible through those shared handles. Startup does not create independent copies of their current values.
 
-The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature remains unchanged.
+The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The builder performs no I/O until `run` is polled. Its required argument struct has no `Default`; external missing admission and sandbox identity are rejected before construction, while supplied-value validation remains in shared startup.
 
 Gateway policy startup probes the host filesystem before adding proxy baseline
 paths. Admission tests inject deterministic baseline enrichment through the
