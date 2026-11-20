@@ -3632,28 +3632,29 @@ async fn run_async() -> Result<()> {
                         } => {
                             let name =
                                 resolve_sandbox_name(name.or(sandbox), &ctx.name, &cli.workspace)?;
-                            // Resolve --tty / --no-tty into an Option<bool> override.
-                            let tty_override = if no_tty {
-                                Some(false)
-                            } else if tty {
-                                Some(true)
-                            } else {
-                                None // auto-detect
-                            };
+
                             let env_map = run::parse_env_pairs(&envs)?;
-                            let exit_code = run::sandbox_exec_grpc(
+                            let mut exec = run::SandboxExec::new(
                                 endpoint,
+                                &cli.workspace,
+                                &tls,
                                 &name,
                                 &command,
-                                workdir.as_deref(),
-                                timeout,
-                                tty_override,
-                                &env_map,
-                                no_login_shell,
-                                &tls,
-                                &cli.workspace,
                             )
-                            .await?;
+                            .with_workdir(workdir.as_deref())
+                            .with_timeout_s(timeout)
+                            .with_environment(env_map);
+                            if !no_login_shell {
+                                exec = exec.with_login_shell();
+                            }
+                            exec = if no_tty {
+                                exec
+                            } else if tty {
+                                exec.with_local_tty()
+                            } else {
+                                exec.with_auto_tty()
+                            };
+                            let exit_code = exec.run().await?;
                             let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                             if exit_code != 0 {
                                 std::process::exit(exit_code);

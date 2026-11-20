@@ -1966,23 +1966,116 @@ fn piped_stdin_limit_error() -> miette::Report {
     miette::miette!("piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input")
 }
 
-/// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
+#[derive(Default)]
+enum ExecTty {
+    #[default]
+    Disabled,
+    Local,
+    Auto,
+}
+
+/// Execute a command in a sandbox through a gateway.
 ///
-/// Returns the remote command's exit code, or an error if the event stream
-/// closes before the command reports an exit status.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn sandbox_exec_grpc(
-    server: &str,
-    name: &str,
-    command: &[String],
-    workdir: Option<&str>,
+/// Resolves the sandbox before selecting buffered or interactive gRPC.
+/// All five constructor arguments are required.
+/// Defaults are no TTY, a non-login shell and no timeout. Local stdin retains
+/// the existing CLI policy: small pipes are buffered and open pipes stream.
+/// Configuration performs no I/O; `run` connects and starts execution.
+#[must_use]
+pub struct SandboxExec<'a> {
+    server: &'a str,
+    workspace: &'a str,
+    tls: &'a TlsOptions,
+    name: &'a str,
+    command: &'a [String],
+    workdir: Option<&'a str>,
     timeout_seconds: u32,
-    tty_override: Option<bool>,
-    environment: &HashMap<String, String>,
-    no_login_shell: bool,
-    tls: &TlsOptions,
-    workspace: &str,
-) -> Result<i32> {
+    tty_mode: ExecTty,
+    environment: HashMap<String, String>,
+    login_shell: bool,
+}
+
+impl<'a> SandboxExec<'a> {
+    /// Supplies the required gateway endpoint, workspace, TLS/authentication
+    /// settings, sandbox name and command. All following settings are optional.
+    pub fn new(
+        server: &'a str,
+        workspace: &'a str,
+        tls: &'a TlsOptions,
+        name: &'a str,
+        command: &'a [String],
+    ) -> Self {
+        Self {
+            server,
+            workspace,
+            tls,
+            name,
+            command,
+            workdir: None,
+            timeout_seconds: 0,
+            tty_mode: ExecTty::default(),
+            environment: HashMap::new(),
+            login_shell: false,
+        }
+    }
+
+    /// Sets the command's working directory inside the sandbox.
+    pub fn with_workdir(mut self, workdir: impl Into<Option<&'a str>>) -> Self {
+        self.workdir = workdir.into();
+        self
+    }
+
+    /// Sets a whole-second timeout. Zero preserves the CLI's no-timeout sentinel.
+    pub fn with_timeout_s(mut self, seconds: u32) -> Self {
+        self.timeout_seconds = seconds;
+        self
+    }
+
+    /// Forces a remote PTY, using the local terminal's current dimensions.
+    pub fn with_local_tty(mut self) -> Self {
+        self.tty_mode = ExecTty::Local;
+        self
+    }
+
+    /// Requests a PTY only when both local stdin and stdout are terminals.
+    pub fn with_auto_tty(mut self) -> Self {
+        self.tty_mode = ExecTty::Auto;
+        self
+    }
+
+    /// Sets environment overrides in the execution request.
+    #[allow(clippy::implicit_hasher)]
+    pub fn with_environment(mut self, environment: HashMap<String, String>) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    /// Enables login-shell startup files, disabled by default.
+    pub fn with_login_shell(mut self) -> Self {
+        self.login_shell = true;
+        self
+    }
+
+    /// Returns the remote exit code, or an error if output closes without one.
+    pub async fn run(self) -> Result<i32> {
+        run_sandbox_exec(self).await
+    }
+}
+
+async fn run_sandbox_exec(exec: SandboxExec<'_>) -> Result<i32> {
+    let SandboxExec {
+        server,
+        workspace,
+        tls,
+        name,
+        command,
+        workdir,
+        timeout_seconds,
+        tty_mode,
+        environment,
+        login_shell,
+    } = exec;
+    let no_login_shell = !login_shell;
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
@@ -2012,7 +2105,11 @@ pub async fn sandbox_exec_grpc(
 
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
     let stdin_is_terminal = std::io::stdin().is_terminal();
-    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+    let tty = match tty_mode {
+        ExecTty::Disabled => false,
+        ExecTty::Local => true,
+        ExecTty::Auto => stdin_is_terminal && std::io::stdout().is_terminal(),
+    };
 
     // Preserve unary exec for small pipes, including older gateways whose
     // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
@@ -2051,42 +2148,39 @@ pub async fn sandbox_exec_grpc(
         )),
         command: command.to_vec(),
         workdir: workdir.unwrap_or_default().to_string(),
-        environment: environment.clone(),
+        environment,
         execution_timeout: proto_execution_timeout(timeout_seconds)?,
-        stdin: stdin_prefix,
+        stdin: Vec::new(),
         tty,
         cols,
         rows,
         no_login_shell,
     };
 
-    let stdin_for_size_check = std::mem::take(&mut request.stdin);
-    let start_request_bytes = request.encoded_len();
-    request.stdin = stdin_for_size_check;
-    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
+    // The command and metadata must fit even when stdin is streamed separately.
+    if request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
         return Err(miette::miette!(
             "exec command or environment exceeds the gateway's 1 MiB message limit"
         ));
     }
+    request.stdin = stdin_prefix;
     if (tty && stdin_is_terminal)
         || stdin_rest.is_some()
         || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
     {
-        return sandbox_exec_streaming_grpc(
-            client,
-            &sandbox,
-            command,
-            workdir,
-            timeout_seconds,
-            environment,
-            no_login_shell,
-            tty,
-            stdin_is_terminal,
-            std::mem::take(&mut request.stdin),
-            stdin_rest,
-            replica.as_ref(),
-        )
-        .await;
+        let prefix = std::mem::take(&mut request.stdin);
+        let input = if stdin_is_terminal {
+            ExecInput::Terminal
+        } else if let Some(rest) = stdin_rest {
+            ExecInput::Piped { prefix, rest }
+        } else {
+            ExecInput::Payload(prefix)
+        };
+        request.sandbox = sandbox.object_name().to_string();
+        request.workspace_scope = Some(openshell_core::proto::workspace_selector(
+            sandbox.object_workspace().to_string(),
+        ));
+        return run_interactive_sandbox_exec(client, request, input, replica.as_ref()).await;
     }
 
     // Make the streaming gRPC call.
@@ -2563,19 +2657,20 @@ impl Drop for TaskGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn sandbox_exec_streaming_grpc(
+enum ExecInput {
+    Payload(Vec<u8>),
+    Piped {
+        prefix: Vec<u8>,
+        rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    },
+    Terminal,
+}
+
+/// Sends a complete, resolved request and drains output through final status.
+async fn run_interactive_sandbox_exec(
     mut client: crate::tls::GrpcClient,
-    sandbox: &Sandbox,
-    command: &[String],
-    workdir: Option<&str>,
-    timeout_seconds: u32,
-    environment: &HashMap<String, String>,
-    no_login_shell: bool,
-    tty: bool,
-    stdin_is_terminal: bool,
-    stdin_prefix: Vec<u8>,
-    stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    request: ExecSandboxRequest,
+    input: ExecInput,
     replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
@@ -2583,32 +2678,26 @@ async fn sandbox_exec_streaming_grpc(
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = if tty {
-        local_terminal_size().unwrap_or((80, 24))
-    } else {
-        (0, 0)
+    let tty = request.tty;
+    let (stdin_is_terminal, stdin_prefix, stdin_rest) = match input {
+        ExecInput::Payload(payload) => (false, payload, None),
+        ExecInput::Piped { prefix, rest } => (false, prefix, Some(rest)),
+        ExecInput::Terminal => (true, Vec::new(), None),
     };
 
-    // The start message carries the exec metadata.
+    if stdin_prefix.len() > MAX_EXEC_STDIN_BYTES {
+        return Err(piped_stdin_limit_error());
+    }
+    if request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+
+    // Reuse the complete request instead of rebuilding its options for this RPC.
     let start = ExecSandboxInput {
-        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-            request_id: String::new(),
-            sandbox: sandbox.object_name().to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (sandbox.object_workspace()).to_string(),
-            )),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            no_login_shell,
-            execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: Vec::new(),
-            tty,
-            cols,
-            rows,
-        })),
+        payload: Some(exec_sandbox_input::Payload::Start(request)),
     };
-
     let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
     input_tx.send(start.clone()).await.into_diagnostic()?;
     let mut stream = match client
@@ -2688,7 +2777,6 @@ async fn sandbox_exec_streaming_grpc(
         });
     } else {
         std::thread::spawn(move || {
-            let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 4096];
             let result = (|| {
                 for chunk in stdin_prefix.chunks(buf.len()) {
@@ -2701,6 +2789,10 @@ async fn sandbox_exec_streaming_grpc(
                         return Ok(());
                     }
                 }
+                if !stdin_is_terminal {
+                    return Ok(());
+                }
+                let mut stdin = std::io::stdin().lock();
                 loop {
                     match stdin.read(&mut buf) {
                         Ok(0) => return Ok(()),
