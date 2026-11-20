@@ -207,34 +207,177 @@ pub fn boundary_service(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::similar_names)]
-pub fn supervisor_pod(
-    namespace: &str,
-    names: &SandboxRuntimeNames,
-    sandbox_id: &str,
-    sandbox_name: &str,
-    gateway_id: &str,
-    supervisor_image: &str,
+/// Required supervisor-pod configuration, named because it exceeds five inputs.
+///
+/// Every field must be supplied to `SupervisorPod::new`; optional pod settings
+/// belong to its fluent methods. There is intentionally no `Default`.
+pub struct SupervisorPodArgs<'a> {
+    /// Namespace in which the supervisor pod is created.
+    pub namespace: &'a str,
+    /// Derived names for the paired sandbox resources.
+    pub names: &'a SandboxRuntimeNames,
+    /// Admitted sandbox identifier injected into the supervisor.
+    pub sandbox_id: &'a str,
+    /// Sandbox name injected into the supervisor.
+    pub sandbox_name: &'a str,
+    /// Gateway identifier used in pod labels.
+    pub gateway_id: &'a str,
+    /// Supervisor container image.
+    pub supervisor_image: &'a str,
+    /// Kubernetes service account assigned to the pod.
+    pub service_account_name: &'a str,
+    /// Supervisor process user ID.
+    pub control_uid: u32,
+    /// Supervisor process and shared-volume group ID.
+    pub control_gid: u32,
+    /// Gateway gRPC endpoint.
+    pub grpc_endpoint: &'a str,
+    /// Source of the gateway CA; `Disabled` is a valid explicit choice.
+    pub client_tls: SupervisorClientTls<'a>,
+    /// Serialized workload process specification.
+    pub main_process_spec: &'a str,
+    /// Supervisor logging verbosity.
+    pub log_level: &'a str,
+    /// Projected service-account token lifetime, in seconds.
+    pub sa_token_ttl_secs: i64,
+    /// Kubernetes ownership used for dependent cleanup.
+    pub owner: OwnerReference,
+}
+
+/// Transport requirement for a configured proxy credential Secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyCredentialTransport {
+    RequireTls,
+    AllowCleartext,
+}
+
+/// Renders a supervisor pod from required arguments and optional settings.
+///
+/// Optional flags default off, optional values are absent, and pull secrets and
+/// tracing variables default empty. Construction performs no Kubernetes I/O.
+#[must_use]
+pub struct SupervisorPod<'a> {
+    args: SupervisorPodArgs<'a>,
     supervisor_pull_policy: Option<crate::KubernetesImagePullPolicy>,
-    service_account_name: &str,
-    control_uid: u32,
-    control_gid: u32,
-    image_pull_secrets: &[String],
-    grpc_endpoint: &str,
-    client_tls: SupervisorClientTls<'_>,
-    main_process_spec: &str,
-    log_level: &str,
-    sa_token_ttl_secs: i64,
-    https_proxy: Option<&str>,
-    no_proxy: Option<&str>,
-    proxy_auth_secret: Option<(&str, &str)>,
-    proxy_auth_allow_insecure: bool,
+    image_pull_secrets: &'a [String],
+    https_proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+    proxy_authentication_secret: Option<(&'a str, &'a str, ProxyCredentialTransport)>,
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
-    provider_spiffe_socket_path: Option<&str>,
-    owner: OwnerReference,
-    tracing_environment: &[(&str, String)],
-) -> Result<Pod, String> {
+    provider_spiffe_socket_path: Option<&'a str>,
+    tracing_environment: &'a [(&'a str, String)],
+}
+
+impl<'a> SupervisorPod<'a> {
+    /// Supplies all fifteen required inputs as named fields.
+    ///
+    /// Every subsequent configuration method is optional; `build` returns rendering errors.
+    pub fn new(args: SupervisorPodArgs<'a>) -> Self {
+        Self {
+            args,
+            supervisor_pull_policy: None,
+            image_pull_secrets: &[],
+            https_proxy: None,
+            no_proxy: None,
+            proxy_authentication_secret: None,
+            proxy_connect_by_hostname: false,
+            upstream_proxy_ca_bundle_staged: false,
+            provider_spiffe_socket_path: None,
+            tracing_environment: &[],
+        }
+    }
+
+    pub fn with_image_pull_policy(mut self, policy: crate::KubernetesImagePullPolicy) -> Self {
+        self.supervisor_pull_policy = Some(policy);
+        self
+    }
+
+    pub fn with_image_pull_secrets(mut self, secrets: &'a [String]) -> Self {
+        self.image_pull_secrets = secrets;
+        self
+    }
+
+    pub fn with_https_proxy(mut self, proxy: &'a str) -> Self {
+        self.https_proxy = Some(proxy);
+        self
+    }
+
+    pub fn with_no_proxy(mut self, hosts: &'a str) -> Self {
+        self.no_proxy = Some(hosts);
+        self
+    }
+
+    /// Configures the Secret name, key and credential-transport choice together.
+    pub fn with_proxy_authentication_secret(
+        mut self,
+        name: &'a str,
+        key: &'a str,
+        transport: ProxyCredentialTransport,
+    ) -> Self {
+        self.proxy_authentication_secret = Some((name, key, transport));
+        self
+    }
+
+    /// Sends destination hostnames instead of validated IPs in proxy CONNECT requests.
+    pub fn with_proxy_connect_by_hostname(mut self) -> Self {
+        self.proxy_connect_by_hostname = true;
+        self
+    }
+
+    /// Uses the operator CA bundle already staged in the bootstrap Secret.
+    pub fn with_staged_proxy_ca_bundle(mut self) -> Self {
+        self.upstream_proxy_ca_bundle_staged = true;
+        self
+    }
+
+    pub fn with_provider_spiffe_socket(mut self, path: &'a str) -> Self {
+        self.provider_spiffe_socket_path = Some(path);
+        self
+    }
+
+    pub fn with_tracing_environment(mut self, environment: &'a [(&'a str, String)]) -> Self {
+        self.tracing_environment = environment;
+        self
+    }
+
+    /// Produces the Kubernetes pod, preserving absent and empty optional values.
+    pub fn build(self) -> Result<Pod, String> {
+        build_supervisor_pod(self)
+    }
+}
+
+#[allow(clippy::similar_names)]
+fn build_supervisor_pod(pod: SupervisorPod<'_>) -> Result<Pod, String> {
+    let SupervisorPod {
+        args,
+        supervisor_pull_policy,
+        image_pull_secrets,
+        https_proxy,
+        no_proxy,
+        proxy_authentication_secret,
+        proxy_connect_by_hostname,
+        upstream_proxy_ca_bundle_staged,
+        provider_spiffe_socket_path,
+        tracing_environment,
+    } = pod;
+    let SupervisorPodArgs {
+        namespace,
+        names,
+        sandbox_id,
+        sandbox_name,
+        gateway_id,
+        supervisor_image,
+        service_account_name,
+        control_uid,
+        control_gid,
+        grpc_endpoint,
+        client_tls,
+        main_process_spec,
+        log_level,
+        sa_token_ttl_secs,
+        owner,
+    } = args;
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
         env_var(
@@ -352,27 +495,14 @@ pub fn supervisor_pod(
     if let Some(hosts) = no_proxy {
         command.extend(["--upstream-no-proxy".to_string(), hosts.to_string()]);
     }
-    if proxy_auth_secret.is_some() {
+    if let Some((secret_name, secret_key, transport)) = proxy_authentication_secret {
         command.extend([
             "--upstream-proxy-auth-file".to_string(),
             openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
         ]);
-    }
-    if proxy_auth_allow_insecure {
-        command.push("--upstream-proxy-auth-allow-insecure".to_string());
-    }
-    if proxy_connect_by_hostname {
-        command.push("--upstream-proxy-connect-by-hostname".to_string());
-    }
-    // The bundle rides in the bootstrap Secret already mounted at
-    // /.openshell/supervisor, so this needs no volume of its own.
-    if upstream_proxy_ca_bundle_staged {
-        command.extend([
-            "--upstream-proxy-ca-bundle".to_string(),
-            UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
-        ]);
-    }
-    if let Some((secret_name, secret_key)) = proxy_auth_secret {
+        if transport == ProxyCredentialTransport::AllowCleartext {
+            command.push("--upstream-proxy-auth-allow-insecure".to_string());
+        }
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
         let mount_path = auth_path
             .parent()
@@ -394,6 +524,17 @@ pub fn supervisor_pod(
                 ..Default::default()
             }),
         ));
+    }
+    if proxy_connect_by_hostname {
+        command.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    // The bundle rides in the bootstrap Secret already mounted at
+    // /.openshell/supervisor, so this needs no volume of its own.
+    if upstream_proxy_ca_bundle_staged {
+        command.extend([
+            "--upstream-proxy-ca-bundle".to_string(),
+            UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
+        ]);
     }
     if let Some(socket_path) = provider_spiffe_socket_path {
         environment.push(env_var(
@@ -809,34 +950,35 @@ mod tests {
         assert!(!data.contains_key("client-tls.key"));
     }
 
-    fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
-        supervisor_pod(
-            "sandbox",
-            &SandboxRuntimeNames::new("pair"),
-            "pair",
-            "demo",
-            "gateway",
-            "supervisor:latest",
-            None,
-            "sandbox-sa",
-            1000,
-            1000,
-            &[],
-            "https://gateway:8080",
+    fn supervisor_pod_args<'a>(
+        names: &'a SandboxRuntimeNames,
+        client_tls: SupervisorClientTls<'a>,
+    ) -> SupervisorPodArgs<'a> {
+        SupervisorPodArgs {
+            namespace: "sandbox",
+            names,
+            sandbox_id: "pair",
+            sandbox_name: "demo",
+            gateway_id: "gateway",
+            supervisor_image: "supervisor:latest",
+            service_account_name: "sandbox-sa",
+            control_uid: 1000,
+            control_gid: 1000,
+            grpc_endpoint: "https://gateway:8080",
             client_tls,
-            "{}",
-            "info",
-            600,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-            owner(),
-            &[],
-        )
+            main_process_spec: "{}",
+            log_level: "info",
+            sa_token_ttl_secs: 600,
+            owner: owner(),
+        }
+    }
+
+    fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
+        SupervisorPod::new(supervisor_pod_args(
+            &SandboxRuntimeNames::new("pair"),
+            client_tls,
+        ))
+        .build()
         .expect("render supervisor Pod")
     }
 
@@ -868,40 +1010,18 @@ mod tests {
     #[test]
     fn supervisor_pod_carries_tracing_environment() {
         const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let client_tls = SupervisorClientTls::Disabled;
-        let pod = supervisor_pod(
-            "sandbox",
+        let pod = SupervisorPod::new(supervisor_pod_args(
             &SandboxRuntimeNames::new("pair"),
-            "pair",
-            "demo",
-            "gateway",
-            "supervisor:latest",
-            None,
-            "sandbox-sa",
-            1000,
-            1000,
-            &[],
-            "https://gateway:8080",
-            client_tls,
-            "{}",
-            "info",
-            600,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-            owner(),
-            &[
-                (
-                    "OPENSHELL_OTLP_ENDPOINT",
-                    "http://collector:4317".to_string(),
-                ),
-                ("TRACEPARENT", TRACEPARENT.to_string()),
-            ],
-        )
+            SupervisorClientTls::Disabled,
+        ))
+        .with_tracing_environment(&[
+            (
+                "OPENSHELL_OTLP_ENDPOINT",
+                "http://collector:4317".to_string(),
+            ),
+            ("TRACEPARENT", TRACEPARENT.to_string()),
+        ])
+        .build()
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
             .env
@@ -995,33 +1115,13 @@ mod tests {
     #[test]
     fn supervisor_pod_is_gated_non_restarting_and_unprivileged() {
         let names = SandboxRuntimeNames::new("pair");
-        let pod = supervisor_pod(
-            "sandbox",
+        let pod = SupervisorPod::new(supervisor_pod_args(
             &names,
-            "pair",
-            "demo",
-            "gateway",
-            "supervisor:latest",
-            Some(crate::KubernetesImagePullPolicy::IfNotPresent),
-            "sandbox-sa",
-            1000,
-            1000,
-            &["registry-credentials".to_string()],
-            "https://gateway:8080",
             SupervisorClientTls::Secret("client-tls"),
-            "{}",
-            "info",
-            600,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-            owner(),
-            &[],
-        )
+        ))
+        .with_image_pull_policy(crate::KubernetesImagePullPolicy::IfNotPresent)
+        .with_image_pull_secrets(&["registry-credentials".to_string()])
+        .build()
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
         assert_eq!(
@@ -1253,34 +1353,15 @@ mod tests {
     /// varying only whether the operator CA bundle was staged.
     fn supervisor_pod_with_staged_proxy_ca(staged: bool) -> Pod {
         let names = SandboxRuntimeNames::new("pair");
-        supervisor_pod(
-            "sandbox",
+        let mut pod = SupervisorPod::new(supervisor_pod_args(
             &names,
-            "pair",
-            "demo",
-            "gateway",
-            "supervisor:latest",
-            None,
-            "sandbox-sa",
-            1000,
-            1000,
-            &[],
-            "https://gateway:8080",
             SupervisorClientTls::Secret("client-tls"),
-            "{}",
-            "info",
-            600,
-            Some("https://proxy.corp.example:3130"),
-            None,
-            None,
-            false,
-            false,
-            staged,
-            None,
-            owner(),
-            &[],
-        )
-        .expect("render supervisor Pod")
+        ))
+        .with_https_proxy("https://proxy.corp.example:3130");
+        if staged {
+            pod = pod.with_staged_proxy_ca_bundle();
+        }
+        pod.build().expect("render supervisor Pod")
     }
 
     #[test]

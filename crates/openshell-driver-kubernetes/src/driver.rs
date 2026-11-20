@@ -14,10 +14,11 @@ use crate::isolation::{
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
-    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
+    ProxyCredentialTransport, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
+    SupervisorClientTls, SupervisorPod, SupervisorPodArgs, boundary_service,
+    generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
-    supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    supervisor_bootstrap_secret, workload_fence,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
@@ -721,6 +722,56 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    /// Apply the validated driver configuration consistently on initial creation
+    /// and supervisor replacement.
+    ///
+    /// Pod identity and workload data stay explicit in `args`; runtime-derived
+    /// pull secrets and tracing live for this render.
+    fn configured_supervisor_pod(
+        &self,
+        args: SupervisorPodArgs<'_>,
+        upstream_proxy_ca_bundle: Option<&[u8]>,
+    ) -> Result<Pod, String> {
+        let image_pull_secrets = self.generation_image_pull_secret_names(args.names);
+        let tracing_environment = self.supervisor_tracing_environment();
+        let mut pod = SupervisorPod::new(args)
+            .with_image_pull_secrets(&image_pull_secrets)
+            .with_tracing_environment(&tracing_environment);
+        if let Some(policy) = self.config.supervisor_image_pull_policy {
+            pod = pod.with_image_pull_policy(policy);
+        }
+        if let Some(proxy) = self.config.https_proxy.as_deref() {
+            pod = pod.with_https_proxy(proxy);
+        }
+        if let Some(hosts) = self.config.no_proxy.as_deref() {
+            pod = pod.with_no_proxy(hosts);
+        }
+        if let Some((name, key)) = self
+            .config
+            .proxy_auth_secret_name
+            .as_deref()
+            .zip(self.config.proxy_auth_secret_key.as_deref())
+        {
+            let transport = if self.config.proxy_auth_allow_insecure == Some(true) {
+                ProxyCredentialTransport::AllowCleartext
+            } else {
+                ProxyCredentialTransport::RequireTls
+            };
+            pod = pod.with_proxy_authentication_secret(name, key, transport);
+        }
+        if self.config.proxy_connect_by_hostname == Some(true) {
+            pod = pod.with_proxy_connect_by_hostname();
+        }
+        if upstream_proxy_ca_bundle.is_some() {
+            pod = pod.with_staged_proxy_ca_bundle();
+        }
+        if self.config.provider_spiffe_enabled() {
+            pod = pod
+                .with_provider_spiffe_socket(&self.config.provider_spiffe_workload_api_socket_path);
+        }
+        pod.build()
+    }
+
     /// Environment that lets a supervisor export spans and join the current trace.
     fn supervisor_tracing_environment(&self) -> Vec<(&'static str, String)> {
         let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() else {
@@ -2460,41 +2511,28 @@ impl KubernetesComputeDriver {
         let supervisor = pods
             .create(
                 &PostParams::default(),
-                &supervisor_pod(
-                    namespace,
-                    names,
-                    &sandbox.id,
-                    &sandbox.name,
-                    &self.config.gateway_id,
-                    &self.config.supervisor_image,
-                    self.config.supervisor_image_pull_policy,
-                    &self.config.service_account_name,
-                    agent_uid,
-                    agent_gid,
-                    &self.generation_image_pull_secret_names(names),
-                    &self.config.grpc_endpoint,
-                    self.config.supervisor_client_tls(),
-                    main_process_spec,
-                    log_level,
-                    self.config.effective_sa_token_ttl_secs(),
-                    self.config.https_proxy.as_deref(),
-                    self.config.no_proxy.as_deref(),
-                    self.config
-                        .proxy_auth_secret_name
-                        .as_deref()
-                        .zip(self.config.proxy_auth_secret_key.as_deref()),
-                    self.config.proxy_auth_allow_insecure == Some(true),
-                    self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    self.config.provider_spiffe_enabled().then_some(
-                        self.config
-                            .provider_spiffe_workload_api_socket_path
-                            .as_str(),
-                    ),
-                    dependent_owner.clone(),
-                    &self.supervisor_tracing_environment(),
-                )
-                .map_err(KubernetesDriverError::Message)?,
+                &self
+                    .configured_supervisor_pod(
+                        SupervisorPodArgs {
+                            namespace,
+                            names,
+                            sandbox_id: &sandbox.id,
+                            sandbox_name: &sandbox.name,
+                            gateway_id: &self.config.gateway_id,
+                            supervisor_image: &self.config.supervisor_image,
+                            service_account_name: &self.config.service_account_name,
+                            control_uid: agent_uid,
+                            control_gid: agent_gid,
+                            grpc_endpoint: &self.config.grpc_endpoint,
+                            client_tls: self.config.supervisor_client_tls(),
+                            main_process_spec,
+                            log_level,
+                            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+                            owner: dependent_owner.clone(),
+                        },
+                        upstream_proxy_ca_bundle.as_deref(),
+                    )
+                    .map_err(KubernetesDriverError::Message)?,
             )
             .await
             .map_err(KubernetesDriverError::from_kube)?;
@@ -3277,46 +3315,33 @@ impl KubernetesComputeDriver {
         let supervisor = pods
             .create(
                 &PostParams::default(),
-                &supervisor_pod(
-                    &namespace,
-                    &names,
-                    sandbox_id,
-                    &sandbox_name,
-                    &self.config.gateway_id,
-                    &self.config.supervisor_image,
-                    self.config.supervisor_image_pull_policy,
-                    &self.config.service_account_name,
-                    agent_uid,
-                    agent_gid,
-                    &self.generation_image_pull_secret_names(&names),
-                    &self.config.grpc_endpoint,
-                    self.config.supervisor_client_tls(),
-                    &main_process_spec,
-                    &log_level,
-                    self.config.effective_sa_token_ttl_secs(),
-                    self.config.https_proxy.as_deref(),
-                    self.config.no_proxy.as_deref(),
-                    self.config
-                        .proxy_auth_secret_name
-                        .as_deref()
-                        .zip(self.config.proxy_auth_secret_key.as_deref()),
-                    self.config.proxy_auth_allow_insecure == Some(true),
-                    self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    self.config.provider_spiffe_enabled().then_some(
-                        self.config
-                            .provider_spiffe_workload_api_socket_path
-                            .as_str(),
-                    ),
-                    sandbox_runtime_sandbox_owner_reference(
-                        cr_name,
-                        cr_uid,
-                        &sandbox_api.resource.api_version,
-                        false,
-                    ),
-                    &self.supervisor_tracing_environment(),
-                )
-                .map_err(KubernetesDriverError::Message)?,
+                &self
+                    .configured_supervisor_pod(
+                        SupervisorPodArgs {
+                            namespace: &namespace,
+                            names: &names,
+                            sandbox_id,
+                            sandbox_name: &sandbox_name,
+                            gateway_id: &self.config.gateway_id,
+                            supervisor_image: &self.config.supervisor_image,
+                            service_account_name: &self.config.service_account_name,
+                            control_uid: agent_uid,
+                            control_gid: agent_gid,
+                            grpc_endpoint: &self.config.grpc_endpoint,
+                            client_tls: self.config.supervisor_client_tls(),
+                            main_process_spec: &main_process_spec,
+                            log_level: &log_level,
+                            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+                            owner: sandbox_runtime_sandbox_owner_reference(
+                                cr_name,
+                                cr_uid,
+                                &sandbox_api.resource.api_version,
+                                false,
+                            ),
+                        },
+                        upstream_proxy_ca_bundle.as_deref(),
+                    )
+                    .map_err(KubernetesDriverError::Message)?,
             )
             .await
             .map_err(KubernetesDriverError::from_kube)?;
