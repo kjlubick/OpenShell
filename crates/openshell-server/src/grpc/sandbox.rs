@@ -3462,15 +3462,15 @@ async fn stream_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
-    let exec = run_exec_with_russh(
-        local_proxy_port,
-        command,
-        stdin_payload,
-        request_tty,
-        no_login_shell,
-        (cols, rows),
-        tx.clone(),
-    );
+    let mut exec =
+        SshExec::new(local_proxy_port, command, tx.clone()).with_stdin_payload(stdin_payload);
+    if request_tty {
+        exec = exec.with_tty(cols, rows);
+    }
+    if !no_login_shell {
+        exec = exec.with_login_shell();
+    }
+    let exec = exec.run();
 
     let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
     if matches!(exec_result, Ok(None)) {
@@ -3539,16 +3539,15 @@ async fn stream_interactive_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
-    let exec = run_interactive_exec_with_russh(
-        local_proxy_port,
-        command,
-        input_stream,
-        request_tty,
-        no_login_shell,
-        cols,
-        rows,
-        tx.clone(),
-    );
+    let mut exec =
+        SshExec::new(local_proxy_port, command, tx.clone()).with_input_stream(input_stream);
+    if request_tty {
+        exec = exec.with_tty(cols, rows);
+    }
+    if !no_login_shell {
+        exec = exec.with_login_shell();
+    }
+    let exec = exec.run();
 
     let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
     if matches!(exec_result, Ok(None)) {
@@ -3618,21 +3617,127 @@ async fn finish_interactive_exec_proxy(mut task: tokio::task::JoinHandle<()>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_interactive_exec_with_russh(
-    local_proxy_port: u16,
-    command: &str,
-    mut input_stream: impl futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
-    request_tty: bool,
-    no_login_shell: bool,
+struct PtySize {
     cols: u32,
     rows: u32,
-    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
-) -> Result<i32, Status> {
-    use futures::StreamExt;
-    use openshell_core::proto::exec_sandbox_input::Payload;
-    use russh::ChannelMsg;
+}
 
+#[derive(Default)]
+struct SshExecOptions {
+    pty: Option<PtySize>,
+    login_shell: bool,
+}
+
+/// Distinguishes the streaming `run` implementation from buffered `Vec<u8>` input.
+/// Keeping `S` concrete permits borrowed streams without `Send` or `'static` bounds.
+struct InputStream<S>(S);
+
+/// An SSH exec operation with optional terminal, shell and input configuration.
+///
+/// All required inputs are supplied to [`Self::new`]. Defaults are no PTY, a
+/// non-login shell and empty buffered stdin. Configuration performs no I/O;
+/// execution begins when the future returned by `run` is polled.
+///
+/// `Input` selects the execution loop: `Vec<u8>` sends its payload and EOF
+/// before draining output; `InputStream<S>` polls input and output concurrently.
+/// Calling `with_input_stream` changes the builder's input type to select that loop.
+#[must_use]
+struct SshExec<'a, Input = Vec<u8>> {
+    local_proxy_port: u16,
+    command: &'a str,
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    options: SshExecOptions,
+    input: Input,
+}
+
+impl<'a> SshExec<'a> {
+    /// Supplies the required localhost proxy port, encoded command and output
+    /// sender. Every subsequent configuration method is optional.
+    fn new(
+        local_proxy_port: u16,
+        command: &'a str,
+        tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    ) -> Self {
+        Self {
+            local_proxy_port,
+            command,
+            tx,
+            options: SshExecOptions::default(),
+            input: Vec::new(),
+        }
+    }
+
+    /// Sends these bytes as stdin, followed by EOF. Omitting this method uses
+    /// empty buffered stdin.
+    fn with_stdin_payload(mut self, payload: Vec<u8>) -> Self {
+        self.input = payload;
+        self
+    }
+
+    /// Selects streaming execution, replacing any buffered payload. The stream
+    /// stays owned by the execution future and may borrow caller state.
+    fn with_input_stream<S>(self, input: S) -> SshExec<'a, InputStream<S>>
+    where
+        S: futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
+    {
+        SshExec {
+            local_proxy_port: self.local_proxy_port,
+            command: self.command,
+            tx: self.tx,
+            options: self.options,
+            input: InputStream(input),
+        }
+    }
+
+    /// Sends the buffered payload and EOF, then drains remote output.
+    fn run(self) -> impl Future<Output = Result<i32, Status>> {
+        run_ssh_exec(self)
+    }
+}
+
+impl<Input> SshExec<'_, Input> {
+    /// Requests a PTY using dimensions in character columns and rows. Callers
+    /// retain responsibility for resolving default dimensions before this call.
+    fn with_tty(mut self, cols: u32, rows: u32) -> Self {
+        self.options.pty = Some(PtySize { cols, rows });
+        self
+    }
+
+    /// Enables login-shell startup files. The default non-login mode sends
+    /// `OPENSHELL_NO_LOGIN_SHELL` and rejects supervisors lacking support for it.
+    fn with_login_shell(mut self) -> Self {
+        self.options.login_shell = true;
+        self
+    }
+}
+
+impl<S> SshExec<'_, InputStream<S>>
+where
+    S: futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
+{
+    /// Executes until remote output completes, the input fails or the response
+    /// stream closes. Input EOF closes stdin while output continues to drain.
+    fn run(self) -> impl Future<Output = Result<i32, Status>> {
+        run_interactive_ssh_exec(self)
+    }
+}
+
+/// Validates the command, authenticates SSH and starts an optional-PTY exec.
+///
+/// Return both handles so each I/O loop retains the client until its existing
+/// channel-close and disconnect cleanup. Input handling stays with the caller.
+async fn start_ssh_exec(
+    local_proxy_port: u16,
+    command: &str,
+    options: SshExecOptions,
+) -> Result<
+    (
+        russh::client::Handle<SandboxSshClientHandler>,
+        russh::Channel<russh::client::Msg>,
+    ),
+    Status,
+> {
+    // Defense-in-depth: validate command at the transport boundary.
     if command.as_bytes().contains(&0) {
         return Err(Status::invalid_argument(
             "command contains null bytes at transport boundary",
@@ -3678,14 +3783,14 @@ async fn run_interactive_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
 
-    if request_tty {
+    if let Some(size) = options.pty {
         channel
-            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .request_pty(false, "xterm-256color", size.cols, size.rows, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
     }
 
-    if no_login_shell {
+    if !options.login_shell {
         let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
         if !supervisor_supports_no_login_shell(&banner) {
             return Err(Status::failed_precondition(
@@ -3702,6 +3807,27 @@ async fn run_interactive_exec_with_russh(
         .exec(true, command.as_bytes())
         .await
         .map_err(|e| Status::internal(format!("failed to execute command over ssh: {e}")))?;
+
+    Ok((client, channel))
+}
+
+async fn run_interactive_ssh_exec<S>(exec: SshExec<'_, InputStream<S>>) -> Result<i32, Status>
+where
+    S: futures::Stream<Item = Result<ExecSandboxInput, Status>> + Unpin,
+{
+    use futures::StreamExt;
+    use openshell_core::proto::exec_sandbox_input::Payload;
+    use russh::ChannelMsg;
+
+    let SshExec {
+        local_proxy_port,
+        command,
+        tx,
+        options,
+        input: InputStream(mut input_stream),
+    } = exec;
+    let request_tty = options.pty.is_some();
+    let (client, channel) = start_ssh_exec(local_proxy_port, command, options).await?;
 
     let (mut read_half, write_half) = channel.split();
 
@@ -3881,87 +4007,15 @@ impl russh::client::Handler for SandboxSshClientHandler {
     }
 }
 
-async fn run_exec_with_russh(
-    local_proxy_port: u16,
-    command: &str,
-    stdin_payload: Vec<u8>,
-    request_tty: bool,
-    no_shell_login: bool,
-    pty_size: (u32, u32),
-    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
-) -> Result<i32, Status> {
-    let (cols, rows) = pty_size;
-
-    // Defense-in-depth: validate command at the transport boundary.
-    if command.as_bytes().contains(&0) {
-        return Err(Status::invalid_argument(
-            "command contains null bytes at transport boundary",
-        ));
-    }
-    if command.len() > MAX_COMMAND_STRING_LEN {
-        return Err(Status::invalid_argument(format!(
-            "command exceeds {MAX_COMMAND_STRING_LEN} byte limit at transport boundary"
-        )));
-    }
-
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-    // russh client end of the loopback exec bridge — disable Nagle so keystroke
-    // and PTY tinygrams don't stall on delayed ACKs.
-    set_tcp_nodelay_best_effort(&stream);
-
-    let config = Arc::new(exec_ssh_client_config());
-    let remote_sshid = Arc::new(std::sync::Mutex::new(None));
-    let handler = SandboxSshClientHandler {
-        remote_sshid: remote_sshid.clone(),
-    };
-    let mut client = russh::client::connect_stream(config, stream, handler)
-        .await
-        .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
-
-    match client
-        .authenticate_none("sandbox")
-        .await
-        .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
-    {
-        AuthResult::Success => {}
-        AuthResult::Failure { .. } => {
-            return Err(Status::permission_denied(
-                "ssh authentication rejected by sandbox",
-            ));
-        }
-    }
-
-    let mut channel = client
-        .channel_open_session()
-        .await
-        .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
-
-    if request_tty {
-        channel
-            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-            .await
-            .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
-    }
-
-    if no_shell_login {
-        let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
-        if !supervisor_supports_no_login_shell(&banner) {
-            return Err(Status::failed_precondition(
-                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
-            ));
-        }
-        channel
-            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
-            .await
-            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
-    }
-
-    channel
-        .exec(true, command.as_bytes())
-        .await
-        .map_err(|e| Status::internal(format!("failed to execute command over ssh: {e}")))?;
+async fn run_ssh_exec(exec: SshExec<'_>) -> Result<i32, Status> {
+    let SshExec {
+        local_proxy_port,
+        command,
+        tx,
+        options,
+        input: stdin_payload,
+    } = exec;
+    let (client, mut channel) = start_ssh_exec(local_proxy_port, command, options).await?;
 
     if !stdin_payload.is_empty() {
         channel

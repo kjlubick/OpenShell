@@ -201,16 +201,10 @@ async fn interactive_exec_drains_stdout_and_stderr_after_input_eof() {
     let fixture = Fixture::new().await;
     let (input_tx, input_rx) = mpsc::channel(2);
     let (output_tx, mut output_rx) = mpsc::channel(2);
-    let exec = run_interactive_exec_with_russh(
-        fixture.port,
-        "test",
-        ReceiverStream::new(input_rx),
-        false,
-        false,
-        0,
-        0,
-        output_tx,
-    );
+    let exec = SshExec::new(fixture.port, "test", output_tx)
+        .with_login_shell()
+        .with_input_stream(ReceiverStream::new(input_rx))
+        .run();
     let exercise = async {
         ready(&mut output_rx).await;
         input_tx
@@ -260,16 +254,10 @@ async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
     let (output_tx, mut output_rx) = mpsc::channel(2);
     let drained = tokio::sync::Notify::new();
     let progress = std::cell::Cell::new((0, 0));
-    let exec = run_interactive_exec_with_russh(
-        fixture.port,
-        "duplex",
-        ReceiverStream::new(input_rx),
-        false,
-        false,
-        0,
-        0,
-        output_tx,
-    );
+    let exec = SshExec::new(fixture.port, "duplex", output_tx)
+        .with_login_shell()
+        .with_input_stream(ReceiverStream::new(input_rx))
+        .run();
     let writer = async {
         for chunk in 1..=CHUNKS {
             input_tx
@@ -355,8 +343,10 @@ async fn interactive_exec_ready_resize_stream_does_not_starve_output() {
     })
     .take(FRAMES);
     let (output_tx, mut output_rx) = mpsc::channel(2);
-    let exec =
-        run_interactive_exec_with_russh(fixture.port, "test", input, false, false, 0, 0, output_tx);
+    let exec = SshExec::new(fixture.port, "test", output_tx)
+        .with_login_shell()
+        .with_input_stream(input)
+        .run();
     let reader = async {
         ready(&mut output_rx).await;
         assert!(
@@ -390,16 +380,10 @@ async fn interactive_exec_input_error_is_not_graceful_eof() {
         let fixture = Fixture::new().await;
         let (input_tx, input_rx) = mpsc::channel(1);
         let (output_tx, mut output_rx) = mpsc::channel(1);
-        let exec = run_interactive_exec_with_russh(
-            fixture.port,
-            "test",
-            ReceiverStream::new(input_rx),
-            false,
-            false,
-            0,
-            0,
-            output_tx,
-        );
+        let exec = SshExec::new(fixture.port, "test", output_tx)
+            .with_login_shell()
+            .with_input_stream(ReceiverStream::new(input_rx))
+            .run();
         let exercise = async {
             ready(&mut output_rx).await;
             input_tx.send(message).await.unwrap();
@@ -420,16 +404,10 @@ async fn interactive_exec_response_drop_cancels_idle_input() {
     let fixture = Fixture::new().await;
     let (input_tx, input_rx) = mpsc::channel(1);
     let (output_tx, mut output_rx) = mpsc::channel(1);
-    let exec = run_interactive_exec_with_russh(
-        fixture.port,
-        "test",
-        ReceiverStream::new(input_rx),
-        false,
-        false,
-        0,
-        0,
-        output_tx,
-    );
+    let exec = SshExec::new(fixture.port, "test", output_tx)
+        .with_login_shell()
+        .with_input_stream(ReceiverStream::new(input_rx))
+        .run();
     let exercise = async {
         ready(&mut output_rx).await;
         drop(output_rx);
@@ -449,16 +427,12 @@ async fn interactive_exec_parent_abort_drops_input_receiver() {
     let fixture = Fixture::new().await;
     let (input_tx, input_rx) = mpsc::channel(1);
     let (output_tx, mut output_rx) = mpsc::channel(1);
-    let exec = tokio::spawn(run_interactive_exec_with_russh(
-        fixture.port,
-        "test",
-        ReceiverStream::new(input_rx),
-        false,
-        false,
-        0,
-        0,
-        output_tx,
-    ));
+    let exec = tokio::spawn(
+        SshExec::new(fixture.port, "test", output_tx)
+            .with_login_shell()
+            .with_input_stream(ReceiverStream::new(input_rx))
+            .run(),
+    );
     ready(&mut output_rx).await;
     // An operation timeout drops the same future as this task abort.
     exec.abort();
@@ -476,16 +450,10 @@ async fn interactive_exec_response_drop_unblocks_full_output_queue() {
     let (output_tx, mut output_rx) = mpsc::channel(1);
     // Use an empty request stream: EOF releases the peer's output once notified.
     drop(input_tx);
-    let exec = run_interactive_exec_with_russh(
-        fixture.port,
-        "test",
-        ReceiverStream::new(input_rx),
-        false,
-        false,
-        0,
-        0,
-        output_tx,
-    );
+    let exec = SshExec::new(fixture.port, "test", output_tx)
+        .with_login_shell()
+        .with_input_stream(ReceiverStream::new(input_rx))
+        .run();
     let exercise = async {
         ready(&mut output_rx).await;
         fixture.release_output.notify_one();
@@ -519,16 +487,10 @@ async fn interactive_exec_early_exit_does_not_wait_for_stdin() {
     let (output_tx, _output_rx) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        run_interactive_exec_with_russh(
-            fixture.port,
-            "early",
-            ReceiverStream::new(input_rx),
-            false,
-            false,
-            0,
-            0,
-            output_tx,
-        ),
+        SshExec::new(fixture.port, "early", output_tx)
+            .with_login_shell()
+            .with_input_stream(ReceiverStream::new(input_rx))
+            .run(),
     )
     .await
     .unwrap();
