@@ -13,6 +13,8 @@ pub mod audit;
 #[cfg(target_os = "windows")]
 pub mod backend;
 #[cfg(target_os = "windows")]
+mod exec_job;
+#[cfg(target_os = "windows")]
 mod identity;
 #[cfg(target_os = "windows")]
 pub mod launch;

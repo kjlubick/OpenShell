@@ -1952,8 +1952,12 @@ impl ComputeRuntime {
             }
 
             let previous = current.clone();
+            // Timeout cleanup can leave a stopped driver entry that needs
+            // fresh launch credentials even though the gateway reports Error.
             let next_identity = if authority.is_some()
-                && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                && (matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                    || is_failed_main_process_result(&current)
+                    || provisioning_timeout)
             {
                 Some(next_runtime_identity(&current)?)
             } else {
@@ -12090,8 +12094,13 @@ mod tests {
         runtime.store.put_message(&session).await.unwrap();
         register_test_supervisor_session(&runtime, sandbox.object_id());
 
+        let authority = test_session_authority();
         let starting = runtime
-            .start_sandbox("default", sandbox.object_name())
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&authority),
+            )
             .await
             .unwrap();
 
@@ -12100,6 +12109,10 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "instance-old");
         assert_eq!(status.exit_code, None);
         assert_eq!(driver.start_calls(), 1);
+        let authentication = driver.start_authentications().pop().unwrap();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentication).unwrap();
+        assert_eq!(authentication.supervisor.auth_epoch.get(), 2);
         assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
         assert!(
             runtime

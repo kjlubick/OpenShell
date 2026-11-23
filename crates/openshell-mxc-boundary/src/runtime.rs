@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::audit::MxcSandboxAuditEvidence;
+use crate::exec_job::ExecJob;
 use openshell_core::jwt::{
     SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
 };
@@ -46,8 +47,12 @@ const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+// Match the Linux boundary's retained exec limit.
+const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 const MAX_REPLAY_ENTRIES: usize = 4096;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+// EX_IOERR from sysexits.h, matching the Linux exec output-delivery status.
+const EXEC_OUTPUT_FAILURE_EXIT_CODE: i32 = 74;
 
 pub fn run_boundary(config_path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(config_path)
@@ -815,7 +820,7 @@ impl BoundaryRuntime {
         );
     }
 
-    async fn start_agent(&self, envelope: &RequestEnvelope) -> Response {
+    fn start_agent(&self, envelope: &RequestEnvelope) -> Response {
         let Request::StartAgent {
             spec,
             policy,
@@ -878,20 +883,11 @@ impl BoundaryRuntime {
             ca_paths.as_ref(),
         );
         let process_id = format!("{}:main:0", self.config.generation);
-        let (program, args) = agent_command(spec.clone());
-        let process = match ManagedProcess::spawn(
-            process_id.clone(),
-            ProcessKindWire::Main,
-            program,
-            args,
-            spec.workdir.clone(),
-            environment,
-        )
-        .await
-        {
-            Ok(process) => Arc::new(process),
-            Err(error) => return guest_error(BoundaryErrorKind::Process, error),
-        };
+        let process =
+            match ManagedProcess::spawn_main(process_id.clone(), spec.clone(), environment) {
+                Ok(process) => Arc::new(process),
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
+            };
         lock(&self.processes).insert(process_id.clone(), process);
         *lock(&self.main_process) = Some(process_id.clone());
         *lock(&self.ca_paths) = ca_paths;
@@ -906,26 +902,32 @@ impl BoundaryRuntime {
         response
     }
 
-    async fn start_exec(&self, envelope: &RequestEnvelope, spec: ExecSpecWire) -> Response {
+    fn start_exec(
+        &self,
+        envelope: &RequestEnvelope,
+        spec: ExecSpecWire,
+    ) -> Result<Arc<ManagedProcess>, (BoundaryErrorKind, String)> {
         if spec.shell.is_some() || spec.runtime_helper.is_some() {
-            return guest_error(
+            return Err((
                 BoundaryErrorKind::Invalid,
-                "MXC does not support shell exec intent or runtime helpers",
-            );
+                "MXC does not support shell exec intent or runtime helpers".into(),
+            ));
         }
         if spec.pty {
-            return guest_error(
+            return Err((
                 BoundaryErrorKind::Invalid,
-                "Windows ConPTY is not enabled for MXC exec",
-            );
+                "Windows ConPTY is not enabled for MXC exec".into(),
+            ));
         }
+        let launch =
+            windows_launch(spec).map_err(|error| (BoundaryErrorKind::Invalid, error.into()))?;
         {
             let mut requests = lock(&self.exec_requests);
             if !requests.insert(envelope.request_id.clone()) {
-                return guest_error(
+                return Err((
                     BoundaryErrorKind::Denied,
-                    "exec request was already consumed",
-                );
+                    "exec request was already consumed".into(),
+                ));
             }
         }
         let id = format!(
@@ -936,28 +938,11 @@ impl BoundaryRuntime {
         let environment = workload_environment(
             &self.config.child_env,
             &lock(&self.provider_environment).1,
-            &spec.env,
+            &launch.env,
             &self.proxy_url,
             lock(&self.ca_paths).as_ref(),
         );
-        let process = match ManagedProcess::spawn(
-            id.clone(),
-            ProcessKindWire::Exec,
-            spec.program,
-            spec.args,
-            spec.workdir,
-            environment,
-        )
-        .await
-        {
-            Ok(process) => Arc::new(process),
-            Err(error) => return guest_error(BoundaryErrorKind::Process, error),
-        };
-        lock(&self.processes).insert(id.clone(), process);
-        Response::ExecStarted {
-            process_id: id,
-            pty: false,
-        }
+        spawn_exec_process(&self.processes, id, launch, environment)
     }
 
     #[allow(
@@ -1018,21 +1003,31 @@ async fn serve_one(
             write_response(&mut stream, &envelope.request_id, response).await
         }
         Request::StartAgent { .. } => {
-            let response = runtime.start_agent(&envelope).await;
+            let response = runtime.start_agent(&envelope);
             write_response(&mut stream, &envelope.request_id, response).await
         }
         Request::Exec { spec } => {
-            let response = runtime.start_exec(&envelope, spec).await;
-            let process_id = match &response {
-                Response::ExecStarted { process_id, .. } => Some(process_id.clone()),
-                _ => None,
+            let process = match runtime.start_exec(&envelope, spec) {
+                Ok(process) => process,
+                Err((kind, message)) => {
+                    return write_response(
+                        &mut stream,
+                        &envelope.request_id,
+                        guest_error(kind, message),
+                    )
+                    .await;
+                }
             };
-            write_response(&mut stream, &envelope.request_id, response).await?;
-            if let Some(process_id) = process_id {
-                let process = runtime.process(&process_id).map_err(response_error)?;
-                bridge_process(stream, process).await?;
-            }
-            Ok(())
+            write_response(
+                &mut stream,
+                &envelope.request_id,
+                Response::ExecStarted {
+                    process_id: process.id.clone(),
+                    pty: false,
+                },
+            )
+            .await?;
+            bridge_process(stream, process).await
         }
         Request::AttachProcess { process_id } => {
             let process = runtime.process(&process_id).map_err(response_error)?;
@@ -1188,6 +1183,61 @@ fn install_ca_environment(
     }
 }
 
+/// The concrete Windows process an exec request resolves to.
+struct WindowsLaunch {
+    program: String,
+    args: Vec<String>,
+    raw_command_tail: Option<String>,
+    workdir: Option<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Resolve a Windows argv launch. Only an explicit cmd.exe command text
+/// argument uses cmd.exe's command-line parsing rules.
+fn windows_launch(spec: ExecSpecWire) -> Result<WindowsLaunch, &'static str> {
+    let ExecSpecWire {
+        program,
+        mut args,
+        env,
+        workdir,
+        ..
+    } = spec;
+    let raw_command_tail = if let Some(flag) = cmd_command_flag(&program, &args) {
+        let [text] = &args[flag + 1..] else {
+            return Err("cmd.exe /c or /k requires one argument containing the command text");
+        };
+        // /s tells cmd.exe to strip the outer quotes, preserving the command inside.
+        let tail = format!("\"{text}\"");
+        args.truncate(flag + 1);
+        if !args[..flag]
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case("/s"))
+        {
+            args.insert(flag, "/s".to_string());
+        }
+        Some(tail)
+    } else {
+        None
+    };
+    Ok(WindowsLaunch {
+        program,
+        args,
+        raw_command_tail,
+        workdir,
+        env,
+    })
+}
+
+fn cmd_command_flag(program: &str, args: &[String]) -> Option<usize> {
+    if !Path::new(program).file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+    }) {
+        return None;
+    }
+    args.iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+}
+
 fn workload_environment(
     child: &HashMap<String, String>,
     providers: &HashMap<String, String>,
@@ -1247,10 +1297,60 @@ struct ManagedProcess {
     id: String,
     kind: ProcessKindWire,
     child: Arc<tokio::sync::Mutex<Child>>,
+    exec_job: Option<ExecJob>,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     output: Arc<OutputLog>,
     exit: tokio::sync::watch::Receiver<Option<ExitStatusWire>>,
     attached: Arc<AtomicBool>,
+}
+
+fn spawn_exec_process(
+    processes: &Mutex<HashMap<String, Arc<ManagedProcess>>>,
+    id: String,
+    launch: WindowsLaunch,
+    environment: HashMap<String, String>,
+) -> Result<Arc<ManagedProcess>, (BoundaryErrorKind, String)> {
+    // Keep admission and insertion under one lock so concurrent execs share the limit.
+    let mut processes = lock(processes);
+    let evict = if processes
+        .values()
+        .filter(|process| process.kind == ProcessKindWire::Exec)
+        .count()
+        >= MAX_RETAINED_EXEC_PROCESSES
+    {
+        // Keep records owned by a caller or an in-flight request.
+        let Some(finished) = processes.values().find(|process| {
+            process.kind == ProcessKindWire::Exec
+                && process.exit_status().is_some()
+                && Arc::strong_count(process) == 1
+        }) else {
+            return Err((
+                BoundaryErrorKind::Unavailable,
+                "MXC exec process limit reached".into(),
+            ));
+        };
+        Some(finished.id.clone())
+    } else {
+        None
+    };
+
+    let process = Arc::new(
+        ManagedProcess::spawn(
+            id.clone(),
+            ProcessKindWire::Exec,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            launch.workdir,
+            environment,
+        )
+        .map_err(|error| (BoundaryErrorKind::Process, error))?,
+    );
+    if let Some(evict) = evict {
+        processes.remove(&evict);
+    }
+    processes.insert(id, process.clone());
+    Ok(process)
 }
 
 async fn drain_output(readers: &mut [tokio::task::JoinHandle<()>; 2]) {
@@ -1275,11 +1375,31 @@ async fn drain_output(readers: &mut [tokio::task::JoinHandle<()>; 2]) {
 }
 
 impl ManagedProcess {
-    async fn spawn(
+    fn spawn_main(
+        id: String,
+        mut spec: AgentSpecWire,
+        environment: HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let workdir = spec.workdir.take();
+        let (program, args) = agent_command(spec);
+        // Preserve the configured startup argument boundaries for Windows quoting.
+        Self::spawn(
+            id,
+            ProcessKindWire::Main,
+            program,
+            args,
+            None,
+            workdir,
+            environment,
+        )
+    }
+
+    fn spawn(
         id: String,
         kind: ProcessKindWire,
         program: String,
         args: Vec<String>,
+        raw_command_tail: Option<String>,
         workdir: Option<String>,
         environment: HashMap<String, String>,
     ) -> Result<Self, String> {
@@ -1293,12 +1413,21 @@ impl ManagedProcess {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .envs(environment);
+        // cmd.exe parses its own command line, so the text after /c must not be
+        // re-quoted with the C runtime rules that `Command::args` applies.
+        if let Some(tail) = raw_command_tail {
+            command.raw_arg(tail);
+        }
         if let Some(workdir) = workdir.filter(|path| !path.trim().is_empty()) {
             command.current_dir(workdir);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("spawn MXC workload executable {program:?}: {error}"))?;
+        let (mut child, exec_job) = match kind {
+            ProcessKindWire::Exec => {
+                ExecJob::spawn(&mut command).map(|(child, job)| (child, Some(job)))
+            }
+            ProcessKindWire::Main => command.spawn().map(|child| (child, None)),
+        }
+        .map_err(|error| format!("spawn MXC workload executable {program:?}: {error}"))?;
         if matches!(kind, ProcessKindWire::Main) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1339,6 +1468,7 @@ impl ManagedProcess {
             id,
             kind,
             child: Arc::new(tokio::sync::Mutex::new(child)),
+            exec_job,
             stdin: tokio::sync::Mutex::new(stdin),
             output,
             exit,
@@ -1417,6 +1547,12 @@ impl ManagedProcess {
     }
 
     async fn terminate(&self) -> Result<(), String> {
+        // The launcher can exit while its descendants are still running.
+        if let Some(job) = &self.exec_job {
+            return job
+                .terminate()
+                .map_err(|error| format!("terminate MXC exec process tree: {error}"));
+        }
         if self.exit_status().is_some() {
             return Ok(());
         }
@@ -1580,17 +1716,32 @@ async fn bridge_process(
 ) -> Result<(), String> {
     let _guard = process.acquire_attachment()?;
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let is_exec = process.kind == ProcessKindWire::Exec;
     let input_process = process.clone();
     let input = async move {
         while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
             match channel {
                 STREAM_STDIN => {
                     let mut stdin = input_process.stdin.lock().await;
-                    let Some(stdin) = stdin.as_mut() else {
+                    let Some(child_stdin) = stdin.as_mut() else {
+                        if is_exec {
+                            continue;
+                        }
                         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"));
                     };
-                    stdin.write_all(&payload).await?;
-                    stdin.flush().await?;
+                    let result = async {
+                        child_stdin.write_all(&payload).await?;
+                        child_stdin.flush().await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        if !is_exec || error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error);
+                        }
+                        // The child can close stdin and still produce output.
+                        // Keep reading client frames so disconnect still ends the relay.
+                        stdin.take();
+                    }
                 }
                 STREAM_STDIN_CLOSED => {
                     input_process.stdin.lock().await.take();
@@ -1607,6 +1758,8 @@ async fn bridge_process(
     };
     tokio::pin!(input);
     let mut cursor = process.output.cursor();
+    // Even a late exec attachment must see every frame starting at zero.
+    let mut expected_sequence = 0;
     loop {
         tokio::select! {
             result = &mut input => {
@@ -1614,6 +1767,20 @@ async fn bridge_process(
             }
             event = cursor.recv() => {
                 let Some(event) = event else { return Ok(()) };
+                if is_exec && event.sequence != expected_sequence {
+                    let _ = process.terminate().await;
+                    let diagnostic = b"openshell: exec output could not be delivered intact\n";
+                    write_stream_frame(&mut writer, STREAM_STDERR, diagnostic)
+                        .await
+                        .map_err(|error| format!("write MXC exec output diagnostic: {error}"))?;
+                    let status = ExitStatusWire::Exited(EXEC_OUTPUT_FAILURE_EXIT_CODE);
+                    let payload = serde_json::to_vec(&status)
+                        .map_err(|error| format!("encode MXC exec output failure: {error}"))?;
+                    return write_stream_frame(&mut writer, STREAM_EXIT, &payload)
+                        .await
+                        .map_err(|error| format!("write MXC exec output failure: {error}"));
+                }
+                expected_sequence = event.sequence.saturating_add(1);
                 write_stream_frame(&mut writer, event.channel, &event.payload)
                     .await
                     .map_err(|error| format!("write MXC process output: {error}"))?;
@@ -1696,6 +1863,128 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv_exec(program: &str, args: &[&str]) -> ExecSpecWire {
+        ExecSpecWire {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            shell: None,
+            runtime_helper: None,
+            env: vec![("FROM_REQUEST".to_string(), "1".to_string())],
+            workdir: Some(r"C:\default".to_string()),
+            pty: false,
+        }
+    }
+
+    #[test]
+    fn cmd_argv_requires_explicit_shell_text() {
+        let program = r"C:\Windows\System32\cmd.exe";
+        let text = r#">"C:\dir\out.txt" echo written"#;
+        let launch = windows_launch(argv_exec(program, &["/d", "/c", text])).unwrap();
+        assert_eq!(launch.program, program);
+        assert_eq!(launch.args, ["/d", "/s", "/c"]);
+        assert_eq!(launch.raw_command_tail, Some(format!("\"{text}\"")));
+        assert!(windows_launch(argv_exec(program, &["/c", "echo", "a & b"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn cmd_writes_a_quoted_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("out file.txt");
+        let command = format!(">\"{}\" echo written", path.display());
+        let launch = windows_launch(argv_exec("cmd.exe", &["/d", "/c", &command])).unwrap();
+        let process = ManagedProcess::spawn(
+            "cmd-quoted-path".to_string(),
+            ProcessKindWire::Exec,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            None,
+            HashMap::new(),
+        )
+        .expect("cmd starts");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("process exits");
+        assert!(matches!(status, ExitStatusWire::Exited(0)), "{status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file written").trim(),
+            "written"
+        );
+    }
+
+    // Keep startup arguments separate so Windows quotes arguments with spaces.
+    // cmd.exe's echo leaves those quotes visible in the output file.
+    #[tokio::test]
+    async fn startup_cmd_preserves_quoting_of_separate_arguments() {
+        let directory = tempfile::tempdir().expect("startup working directory");
+        let workdir = directory.path();
+        let command = AgentSpecWire {
+            program: std::env::var("COMSPEC").expect("Windows command interpreter"),
+            args: ["/d", "/c", "echo", "two words", ">startup.txt"]
+                .map(String::from)
+                .into(),
+            workdir: Some(workdir.to_str().expect("Windows working directory").into()),
+            timeout_secs: 10,
+            interactive: false,
+        };
+        let process = ManagedProcess::spawn_main("startup-test".into(), command, HashMap::new())
+            .expect("startup command launches");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("command exits");
+        assert!(matches!(status, ExitStatusWire::Exited(0)), "{status:?}");
+
+        let output =
+            std::fs::read_to_string(workdir.join("startup.txt")).expect("read startup output");
+        assert_eq!(output.trim_end(), r#""two words""#);
+    }
+
+    #[tokio::test]
+    async fn exec_retention_reuses_only_unreferenced_completed_records() {
+        let processes = Mutex::new(HashMap::new());
+        let cmd = std::env::var("COMSPEC").expect("Windows command interpreter");
+        let start = |id: String| {
+            spawn_exec_process(
+                &processes,
+                id,
+                WindowsLaunch {
+                    workdir: None,
+                    ..windows_launch(argv_exec(&cmd, &["/d", "/c", "exit /b 0"])).unwrap()
+                },
+                HashMap::new(),
+            )
+        };
+
+        // Keep the handles as a client would while reading each exec response.
+        let mut in_use = Vec::new();
+        for index in 0..MAX_RETAINED_EXEC_PROCESSES {
+            let process = start(format!("exec-{index}")).expect("launch exec");
+            let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+                .await
+                .expect("exec finishes");
+            assert!(matches!(status, ExitStatusWire::Exited(0)));
+            in_use.push(process);
+        }
+        let released = in_use.pop().expect("retained exec");
+        let released_id = released.id.clone();
+        drop(released);
+
+        let latest = start("latest".into()).expect("launch another exec");
+        assert!(matches!(
+            start("over-capacity".into()),
+            Err((BoundaryErrorKind::Unavailable, _))
+        ));
+        let records = lock(&processes);
+        assert_eq!(records.len(), MAX_RETAINED_EXEC_PROCESSES);
+        assert!(!records.contains_key(&released_id));
+        assert!(records.contains_key(&latest.id));
+        assert!(
+            in_use
+                .iter()
+                .all(|process| records.contains_key(&process.id))
+        );
+    }
 
     #[test]
     fn exec_environment_keeps_proxy_and_ca_with_refreshed_providers() {
@@ -2015,9 +2304,9 @@ mod tests {
                 "echo relay-free launch".to_string(),
             ],
             None,
+            None,
             HashMap::new(),
         )
-        .await
         .expect("launch real Windows process");
         let guard = process.acquire_attachment().expect("first attachment");
         assert!(process.acquire_attachment().is_err());
@@ -2061,9 +2350,9 @@ mod tests {
                     "(for /L %i in (1,1,2000) do @echo output-line) & echo last-error 1>&2".into(),
                 ],
                 None,
+                None,
                 HashMap::new(),
             )
-            .await
             .expect("launch real command"),
         );
         let (mut client, server) = tokio::io::duplex(4096);
@@ -2091,6 +2380,134 @@ mod tests {
             2000
         );
         assert!(String::from_utf8_lossy(&stderr).contains("last-error"));
+    }
+
+    #[tokio::test]
+    async fn exec_relays_output_after_child_closes_stdin() {
+        // A command can close stdin and keep running. Late input from the client
+        // must leave the relay open for the command's stdout, stderr, and exit
+        // code. Hold the command's final output until after the late writes so
+        // they exercise the relay while it still has output to deliver.
+        let mut process = ManagedProcess::spawn(
+            "closed-stdin-test".into(),
+            ProcessKindWire::Exec,
+            std::env::var("COMSPEC").expect("Windows command interpreter"),
+            [
+                "/d",
+                "/c",
+                "set /p unused=&echo stdout&1>&2 echo stderr&exit /b 7",
+            ]
+            .map(String::from)
+            .into(),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .expect("launch exec process");
+
+        // Substitute a pipe whose read end has closed. Keep the command's
+        // original stdin so the test can let it finish after sending input.
+        let (read_end, write_end) = io::pipe().expect("create test pipe");
+        drop(read_end);
+        let closed_stdin =
+            std::process::ChildStdin::from(std::os::windows::io::OwnedHandle::from(write_end));
+        let closed_stdin = tokio::process::ChildStdin::from_std(closed_stdin).unwrap();
+        let command_stdin = process.stdin.get_mut().replace(closed_stdin).unwrap();
+
+        let (mut client, server) = tokio::io::duplex(1);
+        let exchange = async {
+            write_stream_frame(&mut client, STREAM_STDIN, b"late input")
+                .await
+                .expect("send late input");
+            // The one-byte buffer makes the relay handle each late write before
+            // the next frame can finish sending. Check the relay's result below
+            // for the actual error if it closes the connection.
+            let _ = write_stream_frame(&mut client, STREAM_STDIN, b"more late input").await;
+            let _ = write_stream_frame(&mut client, STREAM_STDIN_CLOSED, b"").await;
+            drop(command_stdin);
+
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            while let Some((channel, payload)) = read_stream_frame(&mut client).await.unwrap() {
+                match channel {
+                    STREAM_STDOUT => stdout.extend(payload),
+                    STREAM_STDERR => stderr.extend(payload),
+                    STREAM_EXIT => {
+                        let status = serde_json::from_slice::<ExitStatusWire>(&payload).unwrap();
+                        return Some((stdout, stderr, status));
+                    }
+                    _ => panic!("unexpected output channel {channel}"),
+                }
+            }
+            None
+        };
+        let (bridge, output) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(bridge_process(server, Arc::new(process)), exchange)
+        })
+        .await
+        .expect("exec attachment finishes");
+        bridge.expect("closed child stdin must leave the relay open for output");
+        let (stdout, stderr, status) = output.expect("exec reports the child's exit status");
+        assert_eq!(stdout, b"stdout\r\n");
+        assert_eq!(stderr, b"stderr\r\n");
+        assert_eq!(status, ExitStatusWire::Exited(7));
+    }
+
+    #[tokio::test]
+    async fn exec_output_is_never_silently_truncated() {
+        let directory = tempfile::tempdir().expect("working directory");
+        let expected = vec![b'x'; 2 * OUTPUT_BUFFER_BYTES];
+        std::fs::write(directory.path().join("output.txt"), &expected).expect("write test output");
+        let workdir = directory.path().to_str().expect("working directory path");
+        let process = ManagedProcess::spawn(
+            "large-output-test".into(),
+            ProcessKindWire::Exec,
+            std::env::var("COMSPEC").expect("Windows command interpreter"),
+            ["/d", "/c", "type", "output.txt"].map(String::from).into(),
+            None,
+            Some(workdir.into()),
+            HashMap::new(),
+        )
+        .expect("launch exec process");
+        let process = Arc::new(process);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let bridge = tokio::spawn(bridge_process(server, process.clone()));
+
+        // Let the child finish while reads are paused so its output overruns the buffer.
+        tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("child exits while reads are paused");
+        let (stderr, status) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stderr = Vec::new();
+            loop {
+                let (channel, payload) = read_stream_frame(&mut client)
+                    .await
+                    .expect("read exec frame")
+                    .expect("exec stream must report an exit status");
+                match channel {
+                    STREAM_STDOUT => {}
+                    STREAM_STDERR => stderr.extend(payload),
+                    STREAM_EXIT => {
+                        let status: ExitStatusWire =
+                            serde_json::from_slice(&payload).expect("decode exec status");
+                        break (stderr, status);
+                    }
+                    _ => panic!("unexpected exec output channel {channel}"),
+                }
+            }
+        })
+        .await
+        .expect("exec stream finishes after reading resumes");
+        bridge
+            .await
+            .expect("join exec bridge")
+            .expect("exec bridge succeeds");
+
+        assert_eq!(status, ExitStatusWire::Exited(74));
+        assert_eq!(
+            stderr,
+            b"openshell: exec output could not be delivered intact\n"
+        );
     }
 
     #[test]

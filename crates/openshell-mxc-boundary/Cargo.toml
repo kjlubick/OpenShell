@@ -34,7 +34,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-windows = { workspace = true, features = ["Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows = { workspace = true, features = ["Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 base64 = { workspace = true }

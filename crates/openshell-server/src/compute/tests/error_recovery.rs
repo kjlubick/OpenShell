@@ -215,6 +215,66 @@ async fn timeout_stop_preserves_cleanup_and_direct_start_recovery() {
 }
 
 #[tokio::test]
+async fn provisioning_retry_refreshes_launch_credentials_for_retained_compute() {
+    // After a provisioning timeout, the gateway still reports Error even
+    // after cleanup stops the MXC runtime. MXC keeps the stopped entry and
+    // requires a newer credential version (auth epoch) to restart it. Check
+    // that Start sends and saves the new epoch for the same runtime generation.
+    let driver = ControlledDriver::new();
+    let runtime = test_runtime(driver.clone()).await;
+    let sandbox = seed_provisioning_attempt(&runtime).await;
+    let initial_identity =
+        PersistedSandboxIdentity::read(&sandbox.metadata.as_ref().unwrap().annotations).unwrap();
+
+    // Use the real cleanup path with a driver that accepts Stop and Start.
+    let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+    let guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
+    let expired = runtime
+        .claim_provisioning_timeout(&sandbox, 300_000)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(guard);
+    runtime
+        .reclaim_provisioning_timeout(&expired, &gate)
+        .await
+        .unwrap();
+    drop(gate);
+    assert_eq!(driver.stop_calls(), 1);
+
+    let authority = test_session_authority();
+    let starting = runtime
+        .start_sandbox_authenticated(
+            sandbox.object_workspace(),
+            sandbox.object_name(),
+            Some(&authority),
+        )
+        .await
+        .unwrap();
+    assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+    assert_eq!(driver.start_calls(), 1);
+    assert_eq!(driver.create_calls.load(Ordering::SeqCst), 0);
+
+    // Check the outgoing request because the test driver accepts any epoch.
+    let encoded = driver.start_authentications().pop().unwrap();
+    let launch: openshell_core::jwt::SandboxLaunchAuthentication =
+        serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        launch.supervisor.auth_epoch.get(),
+        initial_identity.auth_epoch.get() + 1,
+        "the retained MXC entry needs a fresh launch epoch"
+    );
+    assert_eq!(
+        launch.supervisor.runtime_generation,
+        initial_identity.runtime_generation
+    );
+    let saved = stored(&runtime, sandbox.object_id()).await;
+    let saved_identity =
+        PersistedSandboxIdentity::read(&saved.metadata.as_ref().unwrap().annotations).unwrap();
+    assert_eq!(saved_identity.auth_epoch, launch.supervisor.auth_epoch);
+}
+
+#[tokio::test]
 async fn failed_error_stop_retains_retryable_state_without_claiming_success() {
     for observed_error in [false, true] {
         let driver = ControlledDriver::new();
